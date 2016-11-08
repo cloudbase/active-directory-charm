@@ -1,0 +1,31 @@
+name: active-directory
+summary: Windows Active Directory Service
+maintainer: ["Adrian Vladu <avladu@cloudbasesolutions.com>",
+             "Gabriel Samfira <gsamfira@cloudbasesolutions.com>",
+             "Ionut Balutoiu <ibalutoiu@cloudbasesolutions.com>"]
+description: |
+  Active Directory (AD) is a directory service that Microsoft developed 
+  for Windows domain networks. It authenticates and authorizes all users
+  and computers in a Windows domain type network, assigning and enforcing
+  security policies for all computers and installing or updating software.
+categories:
+  - windows
+series:
+  - win2012
+  - win2012hv
+  - win2012r2
+  - win2012hvr2
+  - win2016
+provides:
+  ad-join:
+    interface:
+      ad-join
+  ad-dns:
+    interface:
+      ad-dns
+  ad-spn:
+    interface:
+      ad-spn
+peers:
+  ad-peer:
+    interface: ad-peer
