@@ -984,6 +984,7 @@ function Remove-UnitFromDomain {
         Remove-CharmState -Namespace "AD" -Key "nameservers" | Out-Null
     }
 
+    $cfg = Get-JujuCharmConfig
     $adminName = Get-AdministratorAccount
     $localAdmin = "{0}\{1}" -f @($COMPUTERNAME, $adminName)
     $adminSecurePass = ConvertTo-SecureString $cfg['administrator-password'] -AsPlainText -Force
@@ -1255,11 +1256,11 @@ function Invoke-StopHook {
         return
     }
 
+    Set-DNSToMainDomainController
+
     if(Get-IsDomainController) {
         Uninstall-ADDC
     }
-
-    Set-DNSToMainDomainController
 
     $isCollocatedCharm = Get-IsAnotherCharmCollocated -CurrentComputerName $COMPUTERNAME
     if($isCollocatedCharm) {
