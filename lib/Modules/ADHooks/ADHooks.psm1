@@ -1189,24 +1189,23 @@ function Get-FSMORoles {
         Import-Module ActiveDirectory -Cmdlet Get-ADDomain, Get-ADForest -ErrorAction SilentlyContinue
     }
     PROCESS {
+        $details = Get-CimInstance Win32_ComputerSystem
+
+        if(-not $details.PartOfDomain){
+            return
+        }
+
         foreach ($domain in $DomainName) {
             Write-JujuInfo "Querying $domain"
-            Try {
-            $problem = $false
             $addomain = Get-ADDomain -Identity $domain -ErrorAction Stop
-            } Catch { $problem = $true
-            Write-JujuWarning $_.Exception.Message
-            }
-            if (-not $problem) {
-                $adforest = Get-ADForest -Identity (($addomain).forest)
+            $adforest = Get-ADForest -Identity (($addomain).forest)
 
-                return @{
-                    InfrastructureMaster = $addomain.InfrastructureMaster
-                    PDCEmulator = $addomain.PDCEmulator
-                    RIDMaster = $addomain.RIDMaster
-                    DomainNamingMaster = $adforest.DomainNamingMaster
-                    SchemaMaster = $adforest.SchemaMaster
-                }
+            return @{
+                InfrastructureMaster = $addomain.InfrastructureMaster
+                PDCEmulator = $addomain.PDCEmulator
+                RIDMaster = $addomain.RIDMaster
+                DomainNamingMaster = $adforest.DomainNamingMaster
+                SchemaMaster = $adforest.SchemaMaster
             }
         }
     }
@@ -1223,11 +1222,7 @@ function Remove-ADComputerFromADForest {
         return
     }
 
-    $cfg = Get-JujuCharmConfig
-    $domainCreds = Get-DomainCredential -UserName $cfg['domain-user'] -Password $cfg['domain-user-password']
-
-    [array]$adminNames = Get-AdministratorAccount
-    $adminName = $adminNames[0]
+    $adminName = Get-AdministratorAccount
     $cfg = Get-JujuCharmConfig
     $domainCredential = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
 
@@ -1240,17 +1235,18 @@ function Remove-ADComputerFromADForest {
     $ZoneName = Get-CharmDomain
     $DNSResources = $null
     $DNSResources = Get-DnsServerResourceRecord -ZoneName $ZoneName -Node $Computer -ErrorAction SilentlyContinue
-    if($DNSResources -eq $null){
-        Write-JujuWarning "No DNS record found"
-    } else {
-        foreach ($record in $DNSResources)
-        {
-            Remove-DnsServerResourceRecord -ZoneName $ZoneName -InputObject $record -Force -ErrorAction Stop
-        }
+    if($DNSResources -ne $null){
+        $DNSResources | ForEach-Object { Remove-DnsServerResourceRecord -ZoneName $ZoneName -InputObject $_ -Force -ErrorAction Stop }
     }
 }
 
 function Start-TransferFSMORoles {
+    $leaderCheck = Confirm-Leader
+    if(-not $leaderCheck){
+        Write-JujuWarning "Unit is not leader. Skipping the rest of the hook"
+        return
+    }
+
     $currentMachineName = [System.Net.Dns]::GetHostName()
     $cfg = Get-JujuCharmConfig
     Write-JujuWarning 'Transferring FSMO roles to leader'
@@ -1552,50 +1548,50 @@ function Invoke-ADSPNRelationChangedHook {
 }
 
 function Invoke-UpdateStatusHook {
-    if(!(Confirm-Leader)){
+    $leaderCheck = Confirm-Leader
+    if(-not $leaderCheck){
         Write-JujuWarning "Unit is not leader. Skipping the rest of the hook"
         return
-    } else {
-        $rids = Get-JujuRelationIds -Relation 'ad-peer'
+    }
 
-        $computerNames = @(
-            $COMPUTERNAME)
-        foreach($rid in $rids) {
-            $units = Get-JujuRelatedUnits -RelationId $rid
-            foreach($unit in $units) {
-                $computerAddress = Get-JujuRelation -RelationId $rid -Unit $unit -Attribute 'private-address'
-                $computer = [System.Net.Dns]::GetHostByAddress([string]$computerAddress).HostName
-                if($computer -and ($computer -notIn $computerNames)) {
-                    $computerNames += $computer
-                }
+    $rids = Get-JujuRelationIds -Relation 'ad-peer'
+
+    $computerNames = @(
+        $COMPUTERNAME)
+    foreach($rid in $rids) {
+        $units = Get-JujuRelatedUnits -RelationId $rid
+        foreach($unit in $units) {
+            $computerAddress = Get-JujuRelation -RelationId $rid -Unit $unit -Attribute 'private-address'
+            $computer = [System.Net.Dns]::GetHostByAddress([string]$computerAddress).HostName
+            if($computer -and ($computer -notIn $computerNames)) {
+                $computerNames += $computer
             }
         }
+    }
 
-        $ADComputers = (Get-ADComputer -Filter *).Name
-        $FSMOComputers = (Get-FSMORoles).Values
-        $ADDomain = Get-CharmDomain
-        $FSMOTransferNeeded = $false
-        $ComputersToRemove = @()
+    $ADComputers = (Get-ADComputer -Filter *).Name
+    $FSMOComputers = (Get-FSMORoles).Values
+    $ADDomain = Get-CharmDomain
+    $FSMOTransferNeeded = $false
+    $ComputersToRemove = @()
 
-        foreach ($ADComputer in $ADComputers)
-        {
-            $FQDNComputer = "{0}.{1}" -f @($ADComputer, $ADDomain)
-            if($ADComputer -notIn $computerNames){
-                $ComputersToRemove += $ADComputer
-                Write-JujuWarning "Machine $ADComputer is not in the cluster anymore. Queuing for removal..."
-                if ($FQDNComputer -in $FSMOComputers){
-                    $FSMOTransferNeeded = $true
-                }
+    foreach ($ADComputer in $ADComputers){
+        $FQDNComputer = "{0}.{1}" -f @($ADComputer, $ADDomain)
+        if($ADComputer -notIn $computerNames){
+            $ComputersToRemove += $ADComputer
+            Write-JujuWarning "Machine $ADComputer is not in the cluster anymore. Queuing for removal..."
+            if ($FQDNComputer -in $FSMOComputers){
+                $FSMOTransferNeeded = $true
             }
         }
+    }
 
-        if($FSMOTransferNeeded){
-            Start-TransferFSMORoles
-        }
+    if($FSMOTransferNeeded){
+        Start-TransferFSMORoles
+    }
 
-        foreach($computer in $ComputersToRemove){
-            Remove-ADComputerFromADForest -Computer $computer
-        }
+    foreach($computer in $ComputersToRemove){
+        Remove-ADComputerFromADForest -Computer $computer
     }
 
 }
