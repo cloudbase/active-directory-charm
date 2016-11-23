@@ -1255,6 +1255,56 @@ function Start-TransferFSMORoles {
     Write-JujuWarning 'FSMO roles transferred'
 }
 
+function Set-NodesKCD {
+    Param(
+        [Parameter(Mandatory=$true)]
+        [String]$RelationId,
+        [Parameter(Mandatory=$true)]
+        [String[]]$Units
+    )
+
+    $marshaledConstraints = $null
+    $computerNames = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
+
+    $marshaledConstraints = $null
+    $computerNames = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
+    foreach($unit in $Units) {
+        $data = Get-JujuRelation -RelationId $RelationId -Unit $unit
+        $marshaledConstraints = $data["constraints"]
+        $compName = $data["computername"]
+        if($compName) {
+            $computerNames.Add($compName)
+        }
+    }
+
+    if(!$marshaledConstraints) {
+        Write-JujuWarning "Remote charm didn't set any constraints delegations to be set by AD"
+        return
+    }
+
+    if(!$computerNames) {
+        Write-JujuWarning "No computers names set for the relation: $RelationId"
+        return
+    }
+
+    $constraints = Get-UnmarshaledObject $marshaledConstraints
+
+    Write-JujuWarning ("Setting constraints delegations {0} for the computers: {1}" -f @(($constraints -join ', '), ($computerNames -join ', ')))
+
+    $kcdScript = Join-Path (Get-JujuCharmDir) "hooks\Set-KCD.ps1"
+    foreach($node1 in $computerNames) {
+        foreach($node2 in $computerNames) {
+            if ($node1 -eq $node2) {
+                continue
+            }
+            foreach($constraint in $constraints) {
+                Start-ExternalCommand { & $kcdScript $node1 $node2 -ServiceType $constraint }
+            }
+        }
+    }
+}
+
+
 
 # HOOKS METHODS
 
@@ -1394,6 +1444,7 @@ function Invoke-ADJoinRelationChangedHook {
             $relationSettings = New-ADJoinRelationData -RelationId $rid -Unit $unit
             Set-JujuRelation -RelationId $rid -Settings $relationSettings
         }
+        Set-NodesKCD -RelationId $rid -Units $units
     }
 }
 

@@ -12,9 +12,7 @@ categories:
   - windows
 series:
   - win2012
-  - win2012hv
   - win2012r2
-  - win2012hvr2
   - win2016
 provides:
   ad-join:
