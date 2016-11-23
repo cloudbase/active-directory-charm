@@ -149,7 +149,7 @@ function Close-ADDCPorts {
 function Get-CharmDomain {
     <#
     .SYNOPSIS
-    Returns the fully qualified domain name for this active directory deployment.   
+    Returns the fully qualified domain name for this active directory deployment.
     #>
     $cfg = Get-JujuCharmConfig
 
@@ -1167,6 +1167,94 @@ function Add-ComputerToADGroupDeprecated {
     }
 }
 
+function Get-FSMORoles {
+    <#
+    .SYNOPSIS
+    Retrieves the FSMO role holders from one or more Active Directory domains and forests.
+    .DESCRIPTION
+    Get-FSMORoles uses the Get-ADDomain and Get-ADForest Active Directory cmdlets to determine
+    which domain controller currently holds each of the Active Directory FSMO roles.
+    .PARAMETER DomainName
+    One or more Active Directory domain names.
+    .EXAMPLE
+    Get-Content domainnames.txt | Get-FSMORoles
+    .EXAMPLE
+    Get-FSMORoles -DomainName domain1, domain2
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline=$True)]
+        [string[]]$DomainName = $env:USERDOMAIN
+    )
+    BEGIN {
+        Import-Module ActiveDirectory -Cmdlet Get-ADDomain, Get-ADForest -ErrorAction SilentlyContinue
+    }
+    PROCESS {
+        $details = Get-CimInstance Win32_ComputerSystem
+
+        if(-not $details.PartOfDomain){
+            return
+        }
+
+        foreach ($domain in $DomainName) {
+            Write-JujuInfo "Querying $domain"
+            $addomain = Get-ADDomain -Identity $domain -ErrorAction Stop
+            $adforest = Get-ADForest -Identity (($addomain).forest)
+
+            return @{
+                InfrastructureMaster = $addomain.InfrastructureMaster
+                PDCEmulator = $addomain.PDCEmulator
+                RIDMaster = $addomain.RIDMaster
+                DomainNamingMaster = $adforest.DomainNamingMaster
+                SchemaMaster = $adforest.SchemaMaster
+            }
+        }
+    }
+}
+
+function Remove-ADComputerFromADForest {
+    Param(
+        [Parameter(Mandatory=$true)]
+        [string]$Computer
+    )
+
+    if($Computer -eq ""){
+        Write-JujuWarning "You need to specify a name to delete"
+        return
+    }
+
+    $adminName = Get-AdministratorAccount
+    $cfg = Get-JujuCharmConfig
+    $domainCredential = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
+
+    $computerObject = Get-ADComputer -Identity $Computer
+    if($computerObject) {
+        Write-JujuWarning "Removing $Computer from AD domain"
+        $computerObject | Remove-ADObject -Recursive -Confirm:$false -Credential $domainCredential -ErrorAction SilentlyContinue | Out-Null
+    }
+
+    $ZoneName = Get-CharmDomain
+    $DNSResources = $null
+    $DNSResources = Get-DnsServerResourceRecord -ZoneName $ZoneName -Node $Computer -ErrorAction SilentlyContinue
+    if($DNSResources -ne $null){
+        $DNSResources | ForEach-Object { Remove-DnsServerResourceRecord -ZoneName $ZoneName -InputObject $_ -Force -ErrorAction Stop }
+    }
+}
+
+function Start-TransferFSMORoles {
+    $leaderCheck = Confirm-Leader
+    if(-not $leaderCheck){
+        Write-JujuWarning "Unit is not leader. Skipping the rest of the hook"
+        return
+    }
+
+    $currentMachineName = [System.Net.Dns]::GetHostName()
+    $cfg = Get-JujuCharmConfig
+    Write-JujuWarning 'Transferring FSMO roles to leader'
+    Move-ADDirectoryServerOperationMasterRole -Identity $currentMachineName -OperationMasterRole 0,1,2,3,4 -Force -Confirm:$false -ErrorAction Stop
+    Write-JujuWarning 'FSMO roles transferred'
+}
+
 
 # HOOKS METHODS
 
@@ -1458,4 +1546,53 @@ function Invoke-ADSPNRelationChangedHook {
             }
         }
     }
+}
+
+function Invoke-UpdateStatusHook {
+    $leaderCheck = Confirm-Leader
+    if(-not $leaderCheck){
+        Write-JujuWarning "Unit is not leader. Skipping the rest of the hook"
+        return
+    }
+
+    $rids = Get-JujuRelationIds -Relation 'ad-peer'
+
+    $computerNames = @(
+        $COMPUTERNAME)
+    foreach($rid in $rids) {
+        $units = Get-JujuRelatedUnits -RelationId $rid
+        foreach($unit in $units) {
+            $computerAddress = Get-JujuRelation -RelationId $rid -Unit $unit -Attribute 'private-address'
+            $computer = [System.Net.Dns]::GetHostByAddress([string]$computerAddress).HostName
+            if($computer -and ($computer -notIn $computerNames)) {
+                $computerNames += $computer
+            }
+        }
+    }
+
+    $ADComputers = (Get-ADComputer -Filter *).Name
+    $FSMOComputers = (Get-FSMORoles).Values
+    $ADDomain = Get-CharmDomain
+    $FSMOTransferNeeded = $false
+    $ComputersToRemove = @()
+
+    foreach ($ADComputer in $ADComputers){
+        $FQDNComputer = "{0}.{1}" -f @($ADComputer, $ADDomain)
+        if($ADComputer -notIn $computerNames){
+            $ComputersToRemove += $ADComputer
+            Write-JujuWarning "Machine $ADComputer is not in the cluster anymore. Queuing for removal..."
+            if ($FQDNComputer -in $FSMOComputers){
+                $FSMOTransferNeeded = $true
+            }
+        }
+    }
+
+    if($FSMOTransferNeeded){
+        Start-TransferFSMORoles
+    }
+
+    foreach($computer in $ComputersToRemove){
+        Remove-ADComputerFromADForest -Computer $computer
+    }
+
 }

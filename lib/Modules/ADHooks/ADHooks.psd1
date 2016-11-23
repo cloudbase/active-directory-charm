@@ -42,7 +42,8 @@ FunctionsToExport = @(
     "Invoke-ADJoinRelationDepartedHook",
     "Invoke-ADPeerRelationChangedHook",
     "Invoke-ADDNSRelationChangedHook",
-    "Invoke-ADSPNRelationChangedHook")
+    "Invoke-ADSPNRelationChangedHook",
+    "Invoke-UpdateStatusHook")
 
 # Variables to export from this module
 VariablesToExport = '*'
