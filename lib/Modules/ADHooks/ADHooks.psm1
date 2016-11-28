@@ -207,6 +207,24 @@ function Get-DomainCredential {
     return $domainCredential
 }
 
+function Get-DomainAdminCredentials {
+    $charmDomain = Get-CharmDomain
+    if ((Confirm-IsInDomain $charmDomain) -eq $false) {
+        return $false
+    }
+    # The function returns the SID of the domain administrator. After the reboot when
+    # the AD forest is installed, it takes a while until AD is initialized. The following
+    # function will give 404 until AD is ready, thus a retry is needed.
+    [array]$adminNames = Start-ExecuteWithRetry -ScriptBlock { Get-AdministratorAccount } `
+                                               -MaxRetryCount 30 -RetryInterval 10 `
+                                               -RetryMessage "Failed to get Administrator account name. Probably AD is loading after reboot. Retrying..."
+    $cfg = Get-JujuCharmConfig
+    Add-WindowsUser $adminNames[0] $cfg['administrator-password']
+
+    $domainCreds = Get-DomainCredential -UserName $adminNames[0] -Password $cfg['administrator-password']
+    return $domainCreds
+}
+
 function Install-ADForest {
     Write-JujuWarning "Installing AD Forest"
 
@@ -1255,6 +1273,56 @@ function Start-TransferFSMORoles {
     Write-JujuWarning 'FSMO roles transferred'
 }
 
+function Set-NodesKCD {
+    Param(
+        [Parameter(Mandatory=$true)]
+        [String]$RelationId,
+        [Parameter(Mandatory=$true)]
+        [String[]]$Units
+    )
+
+    $marshaledConstraints = $null
+    $computerNames = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
+
+    $marshaledConstraints = $null
+    $computerNames = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
+    foreach($unit in $Units) {
+        $data = Get-JujuRelation -RelationId $RelationId -Unit $unit
+        $marshaledConstraints = $data["constraints"]
+        $compName = $data["computername"]
+        if($compName) {
+            $computerNames.Add($compName)
+        }
+    }
+
+    if(!$marshaledConstraints) {
+        Write-JujuWarning "Remote charm didn't set any constraints delegations to be set by AD"
+        return
+    }
+
+    if(!$computerNames) {
+        Write-JujuWarning "No computers names set for the relation: $RelationId"
+        return
+    }
+
+    $constraints = Get-UnmarshaledObject $marshaledConstraints
+
+    Write-JujuWarning ("Setting constraints delegations {0} for the computers: {1}" -f @(($constraints -join ', '), ($computerNames -join ', ')))
+
+    $kcdScript = Join-Path (Get-JujuCharmDir) "hooks\Set-KCD.ps1"
+    foreach($node1 in $computerNames) {
+        foreach($node2 in $computerNames) {
+            if ($node1 -eq $node2) {
+                continue
+            }
+            foreach($constraint in $constraints) {
+                Start-ExternalCommand { & $kcdScript $node1 $node2 -ServiceType $constraint }
+            }
+        }
+    }
+}
+
+
 
 # HOOKS METHODS
 
@@ -1394,6 +1462,7 @@ function Invoke-ADJoinRelationChangedHook {
             $relationSettings = New-ADJoinRelationData -RelationId $rid -Unit $unit
             Set-JujuRelation -RelationId $rid -Settings $relationSettings
         }
+        Set-NodesKCD -RelationId $rid -Units $units
     }
 }
 
@@ -1554,7 +1623,7 @@ function Invoke-UpdateStatusHook {
         Write-JujuWarning "Unit is not leader. Skipping the rest of the hook"
         return
     }
-
+    $domainCreds = Get-DomainAdminCredentials
     $rids = Get-JujuRelationIds -Relation 'ad-peer'
 
     $computerNames = @(
@@ -1570,13 +1639,13 @@ function Invoke-UpdateStatusHook {
         }
     }
 
-    $ADComputers = (Get-ADComputer -Filter *).Name
-    $FSMOComputers = (Get-FSMORoles).Values
+    [array]$ADDomainControllers = Get-ADDomainController -Credential $domainCreds
+    [array]$FSMOComputers = (Get-FSMORoles).Values
     $ADDomain = Get-CharmDomain
     $FSMOTransferNeeded = $false
     $ComputersToRemove = @()
 
-    foreach ($ADComputer in $ADComputers){
+    foreach ($ADComputer in $ADDomainControllers){
         $FQDNComputer = "{0}.{1}" -f @($ADComputer, $ADDomain)
         if($ADComputer -notIn $computerNames){
             $ComputersToRemove += $ADComputer
