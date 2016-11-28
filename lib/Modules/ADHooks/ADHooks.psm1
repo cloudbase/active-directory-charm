@@ -207,6 +207,24 @@ function Get-DomainCredential {
     return $domainCredential
 }
 
+function Get-DomainAdminCredentials {
+    $charmDomain = Get-CharmDomain
+    if ((Confirm-IsInDomain $charmDomain) -eq $false) {
+        return $false
+    }
+    # The function returns the SID of the domain administrator. After the reboot when
+    # the AD forest is installed, it takes a while until AD is initialized. The following
+    # function will give 404 until AD is ready, thus a retry is needed.
+    [array]$adminNames = Start-ExecuteWithRetry -ScriptBlock { Get-AdministratorAccount } `
+                                               -MaxRetryCount 30 -RetryInterval 10 `
+                                               -RetryMessage "Failed to get Administrator account name. Probably AD is loading after reboot. Retrying..."
+    $cfg = Get-JujuCharmConfig
+    Add-WindowsUser $adminNames[0] $cfg['administrator-password']
+
+    $domainCreds = Get-DomainCredential -UserName $adminNames[0] -Password $cfg['administrator-password']
+    return $domainCreds
+}
+
 function Install-ADForest {
     Write-JujuWarning "Installing AD Forest"
 
@@ -1605,7 +1623,7 @@ function Invoke-UpdateStatusHook {
         Write-JujuWarning "Unit is not leader. Skipping the rest of the hook"
         return
     }
-
+    $domainCreds = Get-DomainAdminCredentials
     $rids = Get-JujuRelationIds -Relation 'ad-peer'
 
     $computerNames = @(
@@ -1621,13 +1639,13 @@ function Invoke-UpdateStatusHook {
         }
     }
 
-    $ADComputers = (Get-ADComputer -Filter *).Name
-    $FSMOComputers = (Get-FSMORoles).Values
+    [array]$ADDomainControllers = Get-ADDomainController -Credential $domainCreds
+    [array]$FSMOComputers = (Get-FSMORoles).Values
     $ADDomain = Get-CharmDomain
     $FSMOTransferNeeded = $false
     $ComputersToRemove = @()
 
-    foreach ($ADComputer in $ADComputers){
+    foreach ($ADComputer in $ADDomainControllers){
         $FQDNComputer = "{0}.{1}" -f @($ADComputer, $ADDomain)
         if($ADComputer -notIn $computerNames){
             $ComputersToRemove += $ADComputer
