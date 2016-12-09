@@ -1457,7 +1457,10 @@ function Invoke-ADJoinRelationChangedHook {
 
     $rids = Get-JujuRelationIds -Relation 'ad-join'
     foreach($rid in $rids) {
-        $units = Get-JujuRelatedUnits -RelationId $rid
+        [array]$units = Get-JujuRelatedUnits -RelationId $rid
+        if(!$units.Count) {
+            continue
+        }
         foreach($unit in $units) {
             $relationSettings = New-ADJoinRelationData -RelationId $rid -Unit $unit
             Set-JujuRelation -RelationId $rid -Settings $relationSettings
