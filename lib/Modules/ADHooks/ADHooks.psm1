@@ -1273,6 +1273,26 @@ function Start-TransferFSMORoles {
     Write-JujuWarning 'FSMO roles transferred'
 }
 
+function Set-ComputersKCD {
+    Param(
+        [Parameter(Mandatory=$true)]
+        [string]$TrustedComputer,
+        [Parameter(Mandatory=$true)]
+        [string]$TrustingComputer,
+        [Parameter(Mandatory=$true)]
+        [string]$ServiceType,
+        [ValidateSet("Add", "Replace", "Remove")]
+        [string]$Action
+    )
+
+    $params = @{
+        $Action = @{
+            "msDS-AllowedToDelegateTo" = @("$ServiceType/$TrustingComputer","$ServiceType/$TrustingComputer.$env:UserDnsDomain")
+        }
+    }
+    Get-ADComputer $TrustedComputer | Set-ADObject @params
+}
+
 function Set-NodesKCD {
     Param(
         [Parameter(Mandatory=$true)]
@@ -1280,9 +1300,6 @@ function Set-NodesKCD {
         [Parameter(Mandatory=$true)]
         [String[]]$Units
     )
-
-    $marshaledConstraints = $null
-    $computerNames = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
 
     $marshaledConstraints = $null
     $computerNames = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
@@ -1299,29 +1316,68 @@ function Set-NodesKCD {
         Write-JujuWarning "Remote charm didn't set any constraints delegations to be set by AD"
         return
     }
-
     if(!$computerNames) {
         Write-JujuWarning "No computers names set for the relation: $RelationId"
         return
     }
 
     $constraints = Get-UnmarshaledObject $marshaledConstraints
+    $nodesKCDMarshaled = Get-LeaderData -Attribute "nodes-kcd-$RelationId"
+    $nodesKCD = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
+    if($nodesKCDMarshaled) {
+        Get-UnmarshaledObject -Object $nodesKCDMarshaled | ForEach-Object { $nodesKCD.Add($_) }
+    }
 
-    Write-JujuWarning ("Setting constraints delegations {0} for the computers: {1}" -f @(($constraints -join ', '), ($computerNames -join ', ')))
-
-    $kcdScript = Join-Path (Get-JujuCharmDir) "hooks\Set-KCD.ps1"
-    foreach($node1 in $computerNames) {
-        foreach($node2 in $computerNames) {
-            if ($node1 -eq $node2) {
-                continue
-            }
+    [array]$nodesToSetKCD = $computerNames | Where-Object { $_ -notin $nodesKCD }
+    $constraintsStr = $constraints -join ', '
+    $computerNamesStr = $computerNames -join ', '
+    foreach($node in $nodesToSetKCD) {
+        Write-JujuWarning ("Setting kerberos constraints delegations {0} between computer {1} and computers {1}" -f @($constraintsStr, $node, $computerNamesStr))
+        foreach($n in $nodesKCD) {
             foreach($constraint in $constraints) {
-                Start-ExternalCommand { & $kcdScript $node1 $node2 -ServiceType $constraint }
+                Set-ComputersKCD -TrustedComputer $n -TrustingComputer $node -ServiceType $constraint -Action "Add"
+                Set-ComputersKCD -TrustedComputer $node -TrustingComputer $n -ServiceType $constraint -Action "Add"
+            }
+        }
+        $nodesKCD.Add($node)
+    }
+    Set-LeaderData -Settings @{
+        "nodes-kcd-$RelationId" = Get-MarshaledObject -Object $nodesKCD
+    }
+}
+
+function Clear-ComputerKCD {
+    Param(
+        [Parameter(Mandatory=$true)]
+        [String]$RelationId,
+        [Parameter(Mandatory=$true)]
+        [string]$CompName,
+        [Parameter(Mandatory=$true)]
+        [string[]]$Constraints
+    )
+
+    $nodesKCDMarshaled = Get-LeaderData -Attribute "nodes-kcd-$RelationId"
+    if($nodesKCDMarshaled) {
+        $nodesKCD = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
+        Get-UnmarshaledObject -Object $nodesKCDMarshaled | ForEach-Object { $nodesKCD.Add($_) }
+        if($CompName -in $nodesKCD) {
+            foreach($node in $nodesKCD) {
+                foreach($constraint in $Constraints) {
+                    Set-ComputersKCD -TrustedComputer $CompName -TrustingComputer $node -ServiceType $constraint -Action "Remove"
+                    Set-ComputersKCD -TrustedComputer $node -TrustingComputer $CompName -ServiceType $constraint -Action "Remove"
+                }
+            }
+            $nodesKCD.Remove($CompName)
+            if($nodesKCD.Count) {
+                Set-LeaderData -Settings @{
+                    "nodes-kcd-$RelationId" = Get-MarshaledObject -Object $nodesKCD
+                }
+            } else {
+                Set-LeaderData -Settings @{"nodes-kcd-$RelationId" = $null}
             }
         }
     }
 }
-
 
 
 # HOOKS METHODS
@@ -1379,7 +1435,7 @@ function Invoke-InstallHook {
     Restore-DefaultResolvers
     Open-ADDCPorts
 
-    Set-JujuStatus -Status "active"
+    Set-JujuStatus -Status "active" -Message "Unit is ready"
 }
 
 function Invoke-LeaderElectedHook {
@@ -1482,7 +1538,6 @@ function Invoke-ADJoinRelationDepartedHook {
     }
 
     $relationData = Get-JujuRelation
-
     $compName = $relationData['computername']
     if (!$compName) {
         Write-JujuWarning "Remote unit didn't set computername"
@@ -1518,6 +1573,11 @@ function Invoke-ADJoinRelationDepartedHook {
 
     $computerObject = Get-ADComputer -Filter {Name -eq $compName}
     if($computerObject) {
+        $marshaledConstraints = Get-JujuRelation -Attribute "constraints"
+        if($marshaledConstraints) {
+            $constraints = Get-UnmarshaledObject $marshaledConstraints
+            Clear-ComputerKCD -RelationId $currentRelationId -CompName $compName -Constraints $constraints
+        }
         Write-JujuWarning "Removing $compName form AD domain"
         $computerObject | Remove-ADObject -Recursive -Confirm:$false
     }
@@ -1555,7 +1615,7 @@ function Invoke-ADPeerRelationChangedHook {
     Restore-DefaultResolvers
     Open-ADDCPorts
 
-    Set-JujuStatus -Status "active"
+    Set-JujuStatus -Status "active" -Message "Unit is ready"
 }
 
 function Invoke-ADDNSRelationChangedHook {
@@ -1666,5 +1726,4 @@ function Invoke-UpdateStatusHook {
     foreach($computer in $ComputersToRemove){
         Remove-ADComputerFromADForest -Computer $computer
     }
-
 }
