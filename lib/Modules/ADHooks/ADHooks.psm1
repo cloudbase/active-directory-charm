@@ -1702,7 +1702,8 @@ function Invoke-UpdateStatusHook {
         }
     }
 
-    [array]$ADDomainControllers = Get-ADDomainController -Credential $domainCreds
+    [array]$ADDomainControllers = Start-ExecuteWithRetry { Get-ADDomainController -Credential $domainCreds } -MaxRetryCount 30 -RetryInterval 10 `
+                                        -RetryMessage "Failed to get AD domain controllers. Probably domain controller is not yet initialized. Retrying..."
     [array]$FSMOComputers = (Get-FSMORoles).Values
     $ADDomain = Get-CharmDomain
     $FSMOTransferNeeded = $false
