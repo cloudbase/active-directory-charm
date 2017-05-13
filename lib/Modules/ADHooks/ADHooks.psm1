@@ -1312,7 +1312,7 @@ function Set-NodesKCD {
     $constraintsStr = $constraints -join ', '
     $computerNamesStr = $computerNames -join ', '
     foreach($node in $nodesToSetKCD) {
-        Write-JujuWarning ("Setting kerberos constraints delegations {0} between computer {1} and computers {1}" -f @($constraintsStr, $node, $computerNamesStr))
+        Write-JujuWarning ("Setting constraints delegations {0} between computer {1} and computers {1}" -f @($constraintsStr, $node, $computerNamesStr))
         foreach($n in $nodesKCD) {
             foreach($constraint in $constraints) {
                 Set-ComputersKCD -TrustedComputer $n -TrustingComputer $node -ServiceType $constraint -Action "Add"
