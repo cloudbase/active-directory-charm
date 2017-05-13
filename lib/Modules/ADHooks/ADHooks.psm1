@@ -965,8 +965,6 @@ function Uninstall-ADDC {
         Invoke-JujuCommand -Command $cmd | Out-Null
     }
 
-    Uninstall-WindowsFeature 'AD-Certificate'
-
     # Set juju services under LocalSystem user, otherwise they won't start
     # after the reboot.
     $jujuServices = (Get-Service -Name "jujud-*").Name
@@ -1058,24 +1056,6 @@ function Install-ADCertificationAuthority {
     Restart-Service "CertSvc" -Force
 
     return (Get-ADCertificationAuthority -CAName $CAName)
-}
-
-# TODO: This doesn't scale out at the moment. More implementation needed
-#       to provide high availability of AD certificate service.
-#       Move to another module or create subordiante charm.
-function Set-ADCertificationAuthority {
-    Install-WindowsFeature 'AD-Certificate' -IncludeManagementTools
-
-    $cfg = Get-JujuCharmConfig
-    $mainDCIP = Get-LeaderData -Attribute 'main-domain-controller'
-    $privateIP = Get-JujuUnitPrivateIP
-    $caCertificates = Get-ADCertificationAuthority -CAName $cfg['ca-common-name']
-
-    if(!$caCertificates) {
-        if ($mainDCIP -eq $privateIP) {
-            Install-ADCertificationAuthority -CAName $cfg['ca-common-name'] | Out-Null
-        }
-    }
 }
 
 # NOTE(ibalutoiu): This function is deprecated and it will be removed in the future.
@@ -1431,7 +1411,6 @@ function Invoke-InstallHook {
     }
 
     Install-ADForest
-    Set-ADCertificationAuthority
     Restore-DefaultResolvers
     Open-ADDCPorts
 
@@ -1611,7 +1590,6 @@ function Invoke-ADPeerRelationChangedHook {
     }
 
     Start-DomainControllerPromotion
-    Set-ADCertificationAuthority
     Restore-DefaultResolvers
     Open-ADDCPorts
 
