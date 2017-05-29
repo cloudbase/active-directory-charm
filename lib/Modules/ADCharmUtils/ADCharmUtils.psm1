@@ -28,7 +28,6 @@ function Confirm-IsInDomain {
     $currentDomain = (Get-ManagementObject -Class Win32_ComputerSystem).Domain.ToLower()
     $comparedDomain = ($WantedDomain).ToLower()
     $inDomain = $currentDomain.Equals($comparedDomain)
-
     return $inDomain
 }
 
@@ -40,7 +39,6 @@ function Grant-PrivilegesOnDomainUser {
 
     $administratorsGroupSID = "S-1-5-32-544"
     Add-UserToLocalGroup -Username $Username -GroupSID $administratorsGroupSID
-
     Grant-Privilege $Username SeServiceLogonRight
 }
 
@@ -101,7 +99,7 @@ function Get-ActiveDirectoryContext {
     if($global:JUJU_AD_RELATION_CONTEXT) {
         return $global:JUJU_AD_RELATION_CONTEXT
     }
-    $blobKey = ("djoin-" + $env:COMPUTERNAME)
+    $blobKey = ("djoin-" + [System.Net.Dns]::GetHostName())
     $requiredCtx = @{
         "already-joined-${env:COMPUTERNAME}" = $null
         "address" = $null
@@ -110,13 +108,11 @@ function Get-ActiveDirectoryContext {
         "domainName" = $null
         "netbiosname" = $null
     }
-
     $optionalContext = @{
         $blobKey = $null
         "adcredentials" = $null
     }
     $ctx = Get-JujuRelationContext -Relation "ad-join" -RequiredContext $requiredCtx -OptionalContext $optionalContext
-
     # Required context not found
     if(!$ctx.Count) {
         return @{}
@@ -127,7 +123,6 @@ function Get-ActiveDirectoryContext {
     if(($ctx["already-joined-${env:COMPUTERNAME}"] -eq $false) -and !$ctx[$blobKey]) {
         return @{}
     }
-
     # replace the djoin data key with something less dynamic
     $djoinData = $ctx[$blobKey]
     $ctx.Remove($blobKey)
@@ -157,12 +152,10 @@ function Invoke-DJoin {
     )
 
     Write-JujuWarning "Started join domain"
-
     Set-DnsClientServerAddress -InterfaceAlias * -ServerAddresses $DCAddress
     Set-DnsClientGlobalSetting -SuffixSearchList @($DomainSuffix)
     $cmd = @("ipconfig", "/flushdns")
     Invoke-JujuCommand -Command $cmd
-
     $blobFile = Join-Path $env:TMP "djoin-blob.txt"
     Write-FileFromBase64 -File $blobFile -Content $DJoinBlob
     $cmd = @("djoin.exe", "/requestODJ", "/loadfile", $blobFile, "/windowspath", $env:SystemRoot, "/localos")
@@ -211,7 +204,6 @@ function Rename-JujuUnit {
     if(!$cfg['change-hostname']) {
         return $false
     }
-
     $changedHostname = Get-CharmState -Namespace "Common" -Key "ChangedHostname"
     $computerName = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName").ComputerName
     if($changedHostname) {
@@ -222,7 +214,6 @@ function Rename-JujuUnit {
         }
         return $false
     }
-
     $newName = Convert-JujuUnitNameToNetbios
     if ($newName -ne $computerName) {
         Write-JujuWarning ("Changing computername from {0} to {1}" -f @($computerName, $newName))
@@ -230,7 +221,6 @@ function Rename-JujuUnit {
         Set-CharmState -Namespace "Common" -Key "ChangedHostname" -Value $newName
         return $true
     }
-
     return $false
 }
 
@@ -249,11 +239,9 @@ function Invoke-CommandAsDifferentUser {
     )
 
     Grant-Privilege -User $User -Grant "SeServiceLogonRight"
-
     $domainUser = "{0}\{1}" -f @($Domain, $User)
     $securePass = ConvertTo-SecureString $Password -AsPlainText -Force
     $domainCredential = New-Object System.Management.Automation.PSCredential($domainUser, $securePass)
-
     $processArgs = @("-Command", $ScriptBlock)
     if($ArgumentList) {
         $processArgs += @("-Args", $ArgumentList)
