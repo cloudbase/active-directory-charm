@@ -148,12 +148,16 @@ function Invoke-DJoin {
         [Parameter(Mandatory=$true)]
         [String]$DJoinBlob,
         [Parameter(Mandatory=$true)]
-        [String]$DomainSuffix
+        [String]$DomainName
     )
 
+    if (Confirm-IsInDomain $DomainName) {
+        Write-JujuWarning "Domain $DomainName is already joined"
+        return
+    }
     Write-JujuWarning "Started join domain"
     Set-DnsClientServerAddress -InterfaceAlias * -ServerAddresses $DCAddress
-    Set-DnsClientGlobalSetting -SuffixSearchList @($DomainSuffix)
+    Set-DnsClientGlobalSetting -SuffixSearchList @($DomainName)
     $cmd = @("ipconfig", "/flushdns")
     Invoke-JujuCommand -Command $cmd
     $blobFile = Join-Path $env:TMP "djoin-blob.txt"
@@ -187,7 +191,7 @@ function Start-JoinDomain {
         if (!$adCtxt["djoin_blob"] -and $adCtxt["already-joined-${env:COMPUTERNAME}"]) {
             Throw "The domain controller reports that a computer with the same hostname as this unit is already added to the domain, and we did not get any domain join information."
         }
-        Invoke-DJoin -DCAddress $adCtxt['address'] -DJoinBlob $adCtxt['djoin_blob'] -DomainSuffix $adCtxt['domainName']
+        Invoke-DJoin -DCAddress $adCtxt['address'] -DJoinBlob $adCtxt['djoin_blob'] -DomainName $adCtxt['domainName']
     }
     return $true
 }
@@ -224,41 +228,11 @@ function Rename-JujuUnit {
     return $false
 }
 
-function Invoke-CommandAsDifferentUser {
-    Param(
-        [Parameter(Mandatory=$true)]
-        [ScriptBlock]$ScriptBlock,
-        [Parameter(Mandatory=$true)]
-        [String]$User,
-        [Parameter(Mandatory=$true)]
-        [String]$Password,
-        [Parameter(Mandatory=$false)]
-        [String]$Domain='.',
-        [Parameter(Mandatory=$false)]
-        [Array]$ArgumentList
-    )
-
-    Grant-Privilege -User $User -Grant "SeServiceLogonRight"
-    $domainUser = "{0}\{1}" -f @($Domain, $User)
-    $securePass = ConvertTo-SecureString $Password -AsPlainText -Force
-    $domainCredential = New-Object System.Management.Automation.PSCredential($domainUser, $securePass)
-    $processArgs = @("-Command", $ScriptBlock)
-    if($ArgumentList) {
-        $processArgs += @("-Args", $ArgumentList)
-    }
-    $exitCode = Start-ProcessAsUser -Command "$PShome\powershell.exe" -Arguments $processArgs `
-                                    -Credential $domainCredential -LoadUserProfile $false
-    if($exitCode) {
-        Throw "Failed to execute command as $User user. Exit code: $exitCode"
-    }
-}
-
 Export-ModuleMember -Function @(
     'Confirm-IsInDomain',
     'Grant-PrivilegesOnDomainUser',
     'Get-NewCimSession',
     'Get-ActiveDirectoryContext',
     'Rename-JujuUnit',
-    'Start-JoinDomain',
-    'Invoke-CommandAsDifferentUser'
+    'Start-JoinDomain'
 )
