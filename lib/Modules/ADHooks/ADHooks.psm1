@@ -1253,7 +1253,7 @@ function Start-TransferFSMORoles {
     Write-JujuWarning 'FSMO roles transferred'
 }
 
-function Set-ComputersKCD {
+function Set-ConstraintsDelegation {
     Param(
         [Parameter(Mandatory=$true)]
         [string]$TrustedComputer,
@@ -1273,7 +1273,7 @@ function Set-ComputersKCD {
     Get-ADComputer $TrustedComputer | Set-ADObject @params
 }
 
-function Set-NodesKCD {
+function Set-UnitsConstraintsDelegations {
     Param(
         [Parameter(Mandatory=$true)]
         [String]$RelationId,
@@ -1282,81 +1282,91 @@ function Set-NodesKCD {
     )
 
     $marshaledConstraints = $null
-    $computerNames = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
+    $unitsComputerNames = @{}
     foreach($unit in $Units) {
         $data = Get-JujuRelation -RelationId $RelationId -Unit $unit
         $marshaledConstraints = $data["constraints"]
         $compName = $data["computername"]
         if($compName) {
-            $computerNames.Add($compName)
+            $unitsComputerNames[$unit] = $compName
         }
     }
-
     if(!$marshaledConstraints) {
         Write-JujuWarning "Remote charm didn't set any constraints delegations to be set by AD"
         return
     }
-    if(!$computerNames) {
+    if(!$unitsComputerNames.Count) {
         Write-JujuWarning "No computers names set for the relation: $RelationId"
         return
     }
-
     $constraints = Get-UnmarshaledObject $marshaledConstraints
-    $nodesKCDMarshaled = Get-LeaderData -Attribute "nodes-kcd-$RelationId"
-    $nodesKCD = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
-    if($nodesKCDMarshaled) {
-        Get-UnmarshaledObject -Object $nodesKCDMarshaled | ForEach-Object { $nodesKCD.Add($_) }
-    }
-
-    [array]$nodesToSetKCD = $computerNames | Where-Object { $_ -notin $nodesKCD }
-    $constraintsStr = $constraints -join ', '
-    $computerNamesStr = $computerNames -join ', '
-    foreach($node in $nodesToSetKCD) {
-        Write-JujuWarning ("Setting constraints delegations {0} between computer {1} and computers {1}" -f @($constraintsStr, $node, $computerNamesStr))
-        foreach($n in $nodesKCD) {
-            foreach($constraint in $constraints) {
-                Set-ComputersKCD -TrustedComputer $n -TrustingComputer $node -ServiceType $constraint -Action "Add"
-                Set-ComputersKCD -TrustedComputer $node -TrustingComputer $n -ServiceType $constraint -Action "Add"
-            }
+    $leaderData = Get-LeaderData
+    $unitsWithConstraints = @{}
+    $unitsToSetConstraints = @{}
+    foreach($unit in $Units) {
+        $compName = $leaderData["constraints-${RelationId}-${unit}"]
+        if($compName) {
+            $unitsWithConstraints[$unit] = $compName
+            continue
         }
-        $nodesKCD.Add($node)
+        if($unitsComputerNames[$unit]) {
+            $unitsToSetConstraints[$unit] = $unitsComputerNames[$unit]
+        }
     }
-    Set-LeaderData -Settings @{
-        "nodes-kcd-$RelationId" = Get-MarshaledObject -Object $nodesKCD
+    try {
+        $leaderSettings = @{}
+        foreach($unit in $unitsToSetConstraints.Keys) {
+            $compName = $unitsToSetConstraints[$unit]
+            [array]$computerNamesWithConstraints = $unitsWithConstraints.Values
+            $msg = "Setting constraints delegations {0} between computer {1} and computers {1}" -f @(($constraints -join ', '),
+                                                                                                     $compName,
+                                                                                                     ($computerNamesWithConstraints -join ', '))
+            Write-JujuWarning $msg
+            foreach($c in $computerNamesWithConstraints) {
+                foreach($constraint in $constraints) {
+                    Set-ConstraintsDelegation -TrustedComputer $c -TrustingComputer $compName -ServiceType $constraint -Action "Add"
+                    Set-ConstraintsDelegation -TrustedComputer $compName -TrustingComputer $c -ServiceType $constraint -Action "Add"
+                }
+            }
+            $unitsWithConstraints[$unit] = $compName
+            $leaderSettings["constraints-${RelationId}-${unit}"] = $compName
+        }
+    } finally {
+        if($leaderSettings.Count) {
+            Set-LeaderData -Settings $leaderSettings
+        }
     }
 }
 
-function Clear-ComputerKCD {
+function Clear-ComputerConstraintsDelegations {
     Param(
         [Parameter(Mandatory=$true)]
         [String]$RelationId,
+        [Parameter(Mandatory=$true)]
+        [string]$RemoteUnit,
         [Parameter(Mandatory=$true)]
         [string]$CompName,
         [Parameter(Mandatory=$true)]
         [string[]]$Constraints
     )
 
-    $nodesKCDMarshaled = Get-LeaderData -Attribute "nodes-kcd-$RelationId"
-    if($nodesKCDMarshaled) {
-        $nodesKCD = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
-        Get-UnmarshaledObject -Object $nodesKCDMarshaled | ForEach-Object { $nodesKCD.Add($_) }
-        if($CompName -in $nodesKCD) {
-            foreach($node in $nodesKCD) {
-                foreach($constraint in $Constraints) {
-                    Set-ComputersKCD -TrustedComputer $CompName -TrustingComputer $node -ServiceType $constraint -Action "Remove"
-                    Set-ComputersKCD -TrustedComputer $node -TrustingComputer $CompName -ServiceType $constraint -Action "Remove"
-                }
-            }
-            $nodesKCD.Remove($CompName)
-            if($nodesKCD.Count) {
-                Set-LeaderData -Settings @{
-                    "nodes-kcd-$RelationId" = Get-MarshaledObject -Object $nodesKCD
-                }
-            } else {
-                Set-LeaderData -Settings @{"nodes-kcd-$RelationId" = $null}
-            }
+    $leaderData = Get-LeaderData
+    $unitsWithConstraints = @{}
+    $units = Get-JujuRelatedUnits -RelationId $RelationId
+    foreach($unit in $units) {
+        $name = $leaderData["constraints-${RelationId}-${unit}"]
+        if($name) {
+            $unitsWithConstraints[$unit] = $name
         }
     }
+    [array]$computerNamesWithConstraints = $unitsWithConstraints.Values
+    foreach($c in $computerNamesWithConstraints) {
+        foreach($constraint in $Constraints) {
+            Set-ConstraintsDelegation -TrustedComputer $CompName -TrustingComputer $c -ServiceType $constraint -Action "Remove"
+            Set-ConstraintsDelegation -TrustedComputer $c -TrustingComputer $CompName -ServiceType $constraint -Action "Remove"
+        }
+    }
+    Set-LeaderData -Settings @{"constraints-${RelationId}-${RemoteUnit}" = $null}
 }
 
 
@@ -1500,7 +1510,7 @@ function Invoke-ADJoinRelationChangedHook {
             $relationSettings = New-ADJoinRelationData -RelationId $rid -Unit $unit
             Set-JujuRelation -RelationId $rid -Settings $relationSettings
         }
-        Set-NodesKCD -RelationId $rid -Units $units
+        Set-UnitsConstraintsDelegations -RelationId $rid -Units $units
     }
 }
 
@@ -1510,26 +1520,22 @@ function Invoke-ADJoinRelationDepartedHook {
         Write-JujuWarning "AD forest is not yet installed. Skipping the rest of the hook"
         return
     }
-
     if (!(Confirm-Leader)) {
         Write-JujuWarning "Unit is not leader. Skipping the rest of the hook"
         return
     }
-
     $relationData = Get-JujuRelation
     $compName = $relationData['computername']
     if (!$compName) {
         Write-JujuWarning "Remote unit didn't set computername"
         return
     }
-
     # Remove computer from the AD domain
     $blobName = ("djoin-" + $compName)
     $blob = Get-LeaderData -Attribute $blobName
     if(!$blob) {
         return
     }
-
     # Check if there is another collocated charm joined to the AD domain. If
     # so, we don't need to remove the machine from AD.
     $currentRelationId = Get-JujuRelationId
@@ -1539,7 +1545,6 @@ function Invoke-ADJoinRelationDepartedHook {
         Write-JujuWarning "Computer $CurrentComputerName needs to be joined to AD"
         return
     }
-
     if($relationData['service-accounts']) {
         $serviceAccounts = Get-UnmarshaledObject $relationData['service-accounts']
         foreach($service in $serviceAccounts.Keys) {
@@ -1549,18 +1554,18 @@ function Invoke-ADJoinRelationDepartedHook {
             }
         }
     }
-
     $computerObject = Get-ADComputer -Filter {Name -eq $compName}
     if($computerObject) {
         $marshaledConstraints = Get-JujuRelation -Attribute "constraints"
         if($marshaledConstraints) {
+            $remoteUnit = Get-JujuRemoteUnit
             $constraints = Get-UnmarshaledObject $marshaledConstraints
-            Clear-ComputerKCD -RelationId $currentRelationId -CompName $compName -Constraints $constraints
+            Clear-ComputerConstraintsDelegations -RelationId $currentRelationId -RemoteUnit $remoteUnit `
+                                                 -CompName $compName -Constraints $constraints
         }
         Write-JujuWarning "Removing $compName form AD domain"
         $computerObject | Remove-ADObject -Recursive -Confirm:$false
     }
-
     Set-LeaderData -Settings @{$blobName = $null}
     $blobFile = Join-Path $DJOIN_BLOBS_DIR ($compName + ".txt")
     if(Test-Path $blobFile) {
