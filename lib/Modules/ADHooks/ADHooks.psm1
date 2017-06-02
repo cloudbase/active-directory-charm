@@ -18,7 +18,7 @@ Import-Module JujuHooks
 Import-Module JujuUtils
 Import-Module JujuWindowsUtils
 
-$COMPUTERNAME = [System.Net.Dns]::GetHostName()
+$COMPUTER_NAME = [System.Net.Dns]::GetHostName()
 $DJOIN_BLOBS_DIR = Join-Path $env:TEMP "blobs"
 
 
@@ -76,7 +76,7 @@ function Add-DNSForwarders {
     }
 
     # Reset DNS server forwarders
-    $cmd = @("dnscmd.exe", $COMPUTERNAME, "/resetforwarders")
+    $cmd = @("dnscmd.exe", $COMPUTER_NAME, "/resetforwarders")
     Invoke-JujuCommand -Command $cmd | Out-Null
 
     Import-Module DnsServer
@@ -85,7 +85,7 @@ function Add-DNSForwarders {
         if($i -eq "127.0.0.1") {
             continue
         }
-        Add-DnsServerForwarder -ComputerName $COMPUTERNAME -IPAddress $i
+        Add-DnsServerForwarder -ComputerName $COMPUTER_NAME -IPAddress $i
     }
 }
 
@@ -560,7 +560,7 @@ function New-ADJoinRelationData {
     $domainInfo = Get-ADDomain
     $relationSettings = @{
         'address' = Get-JujuUnitPrivateIP
-        'hostname' = $COMPUTERNAME
+        'hostname' = $COMPUTER_NAME
         'username' = $cfg['domain-user']
         'password' = $cfg['domain-user-password']
         'domainName' = $domainInfo.Forest
@@ -821,7 +821,7 @@ function Get-IsDomainController {
         (Get-ADDomainController -Credential $domainCreds -Filter {Enabled -eq $true}).Name
     } -MaxRetryCount 30 -RetryInterval 10 `
       -RetryMessage "Failed to get AD domain controllers. Probably domain controller rebooted and is not yet initialized. Retrying..."
-    if($COMPUTERNAME -notin $domainControllers) {
+    if($COMPUTER_NAME -notin $domainControllers) {
         return $false
     }
 
@@ -830,7 +830,7 @@ function Get-IsDomainController {
 
 function Start-DomainControllerPromotion {
     if(Get-IsDomainController) {
-        Write-JujuWarning "$COMPUTERNAME is already a domain controller"
+        Write-JujuWarning "$COMPUTER_NAME is already a domain controller"
         return
     }
 
@@ -850,7 +850,7 @@ function Start-DomainControllerPromotion {
     $charmDomain = Get-CharmDomain
     Join-Domain -Domain $charmDomain -LocalCredential $localCredential -DomainCredential $domainCreds
 
-    Write-JujuWarning "Promoting $COMPUTERNAME to Domain Controller"
+    Write-JujuWarning "Promoting $COMPUTER_NAME to Domain Controller"
 
     $netbiosName = $charmDomain.Split('.')[0]
     $safeModeSecurePass = ConvertTo-SecureString $cfg['safe-mode-password'] -AsPlainText -Force
@@ -859,7 +859,7 @@ function Start-DomainControllerPromotion {
             -DomainName $netbiosName -SafeModeAdministratorPassword $safeModeSecurePass `
             -NoRebootOnCompletion -Credential $domainCreds -Confirm:$false -Force
         if($stat.Status -ne "Success") {
-            Throw "Failed to promote $COMPUTERNAME to domain controller"
+            Throw "Failed to promote $COMPUTER_NAME to domain controller"
         }
         return $stat
     } -RetryMessage "Failed to add new domain controller. Retrying"
@@ -936,7 +936,7 @@ function New-RelationDNSReconds {
 }
 
 function Uninstall-ADDC {
-    Write-JujuWarning "Destroying AD domain controller $COMPUTERNAME"
+    Write-JujuWarning "Destroying AD domain controller $COMPUTER_NAME"
 
     $cfg = Get-JujuCharmConfig
     $adminName = Get-AdministratorAccount
@@ -973,10 +973,10 @@ function Uninstall-ADDC {
     $stat = Start-ExecuteWithRetry {
         $stat = Uninstall-ADDSDomainController @parameters
         if($stat.Status -ne "Success") {
-            Throw "Failed to uninstall domain controller $COMPUTERNAME"
+            Throw "Failed to uninstall domain controller $COMPUTER_NAME"
         }
         return $stat
-    } -RetryMessage "Failed to uninstall the AD domain controller $COMPUTERNAME"
+    } -RetryMessage "Failed to uninstall the AD domain controller $COMPUTER_NAME"
 
     Close-ADDCPorts
 
@@ -1002,12 +1002,12 @@ function Remove-UnitFromDomain {
 
     $cfg = Get-JujuCharmConfig
     $adminName = Get-AdministratorAccount
-    $localAdmin = "{0}\{1}" -f @($COMPUTERNAME, $adminName)
+    $localAdmin = "{0}\{1}" -f @($COMPUTER_NAME, $adminName)
     $adminSecurePass = ConvertTo-SecureString $cfg['administrator-password'] -AsPlainText -Force
     $localCreds = New-Object PSCredential($localAdmin, $adminSecurePass)
 
     # Join the default WORKGROUP
-    Remove-Computer -Credential $localCreds -WorkgroupName "WORKGROUP" -ComputerName $COMPUTERNAME -Force -Confirm:$false | Out-Null
+    Remove-Computer -Credential $localCreds -WorkgroupName "WORKGROUP" -ComputerName $COMPUTER_NAME -Force -Confirm:$false | Out-Null
 }
 
 # TODO: Move to another module or create subordiante charm
@@ -1463,7 +1463,7 @@ function Invoke-StopHook {
         Uninstall-ADDC
     }
 
-    $isCollocatedCharm = Get-IsAnotherCharmCollocated -CurrentComputerName $COMPUTERNAME
+    $isCollocatedCharm = Get-IsAnotherCharmCollocated -CurrentComputerName $COMPUTER_NAME
     if($isCollocatedCharm) {
         Write-JujuWarning "Machine still needs to be joined to AD"
         return
@@ -1472,7 +1472,7 @@ function Invoke-StopHook {
     # TODO(ibalutoiu): This must be done by other peer units in order to have
     #                  the computer deleted from AD even when the current
     #                  unit is brutally killed.
-    $computerObject = Get-ADComputer -Filter {Name -eq $COMPUTERNAME}
+    $computerObject = Get-ADComputer -Filter {Name -eq $COMPUTER_NAME}
     if($computerObject) {
         # TODO(ibalutoiu): Create separate functions to get domain administrator account name or local administrator account name.
         #                  Sometimes, function 'Get-AdministratorAccount' may return an array with both the names for local administrator and domain administrator.
@@ -1481,7 +1481,7 @@ function Invoke-StopHook {
         $cfg = Get-JujuCharmConfig
         $domainCredential = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
 
-        Write-JujuWarning "Removing $COMPUTERNAME from AD domain"
+        Write-JujuWarning "Removing $COMPUTER_NAME from AD domain"
         Remove-ADObject -Identity $computerObject -Recursive -Confirm:$false -Credential $domainCredential | Out-Null
     }
 
@@ -1673,7 +1673,7 @@ function Invoke-UpdateStatusHook {
     $rids = Get-JujuRelationIds -Relation 'ad-peer'
 
     $computerNames = @(
-        $COMPUTERNAME)
+        $COMPUTER_NAME)
     foreach($rid in $rids) {
         $units = Get-JujuRelatedUnits -RelationId $rid
         foreach($unit in $units) {
