@@ -18,7 +18,7 @@ Import-Module JujuHooks
 Import-Module JujuUtils
 Import-Module JujuWindowsUtils
 
-$COMPUTERNAME = [System.Net.Dns]::GetHostName()
+$COMPUTER_NAME = [System.Net.Dns]::GetHostName()
 $DJOIN_BLOBS_DIR = Join-Path $env:TEMP "blobs"
 
 
@@ -76,7 +76,7 @@ function Add-DNSForwarders {
     }
 
     # Reset DNS server forwarders
-    $cmd = @("dnscmd.exe", $COMPUTERNAME, "/resetforwarders")
+    $cmd = @("dnscmd.exe", $COMPUTER_NAME, "/resetforwarders")
     Invoke-JujuCommand -Command $cmd | Out-Null
 
     Import-Module DnsServer
@@ -85,7 +85,7 @@ function Add-DNSForwarders {
         if($i -eq "127.0.0.1") {
             continue
         }
-        Add-DnsServerForwarder -ComputerName $COMPUTERNAME -IPAddress $i
+        Add-DnsServerForwarder -ComputerName $COMPUTER_NAME -IPAddress $i
     }
 }
 
@@ -560,7 +560,7 @@ function New-ADJoinRelationData {
     $domainInfo = Get-ADDomain
     $relationSettings = @{
         'address' = Get-JujuUnitPrivateIP
-        'hostname' = $COMPUTERNAME
+        'hostname' = $COMPUTER_NAME
         'username' = $cfg['domain-user']
         'password' = $cfg['domain-user-password']
         'domainName' = $domainInfo.Forest
@@ -821,7 +821,7 @@ function Get-IsDomainController {
         (Get-ADDomainController -Credential $domainCreds -Filter {Enabled -eq $true}).Name
     } -MaxRetryCount 30 -RetryInterval 10 `
       -RetryMessage "Failed to get AD domain controllers. Probably domain controller rebooted and is not yet initialized. Retrying..."
-    if($COMPUTERNAME -notin $domainControllers) {
+    if($COMPUTER_NAME -notin $domainControllers) {
         return $false
     }
 
@@ -830,7 +830,7 @@ function Get-IsDomainController {
 
 function Start-DomainControllerPromotion {
     if(Get-IsDomainController) {
-        Write-JujuWarning "$COMPUTERNAME is already a domain controller"
+        Write-JujuWarning "$COMPUTER_NAME is already a domain controller"
         return
     }
 
@@ -850,7 +850,7 @@ function Start-DomainControllerPromotion {
     $charmDomain = Get-CharmDomain
     Join-Domain -Domain $charmDomain -LocalCredential $localCredential -DomainCredential $domainCreds
 
-    Write-JujuWarning "Promoting $COMPUTERNAME to Domain Controller"
+    Write-JujuWarning "Promoting $COMPUTER_NAME to Domain Controller"
 
     $netbiosName = $charmDomain.Split('.')[0]
     $safeModeSecurePass = ConvertTo-SecureString $cfg['safe-mode-password'] -AsPlainText -Force
@@ -859,7 +859,7 @@ function Start-DomainControllerPromotion {
             -DomainName $netbiosName -SafeModeAdministratorPassword $safeModeSecurePass `
             -NoRebootOnCompletion -Credential $domainCreds -Confirm:$false -Force
         if($stat.Status -ne "Success") {
-            Throw "Failed to promote $COMPUTERNAME to domain controller"
+            Throw "Failed to promote $COMPUTER_NAME to domain controller"
         }
         return $stat
     } -RetryMessage "Failed to add new domain controller. Retrying"
@@ -936,7 +936,7 @@ function New-RelationDNSReconds {
 }
 
 function Uninstall-ADDC {
-    Write-JujuWarning "Destroying AD domain controller $COMPUTERNAME"
+    Write-JujuWarning "Destroying AD domain controller $COMPUTER_NAME"
 
     $cfg = Get-JujuCharmConfig
     $adminName = Get-AdministratorAccount
@@ -965,8 +965,6 @@ function Uninstall-ADDC {
         Invoke-JujuCommand -Command $cmd | Out-Null
     }
 
-    Uninstall-WindowsFeature 'AD-Certificate'
-
     # Set juju services under LocalSystem user, otherwise they won't start
     # after the reboot.
     $jujuServices = (Get-Service -Name "jujud-*").Name
@@ -975,10 +973,10 @@ function Uninstall-ADDC {
     $stat = Start-ExecuteWithRetry {
         $stat = Uninstall-ADDSDomainController @parameters
         if($stat.Status -ne "Success") {
-            Throw "Failed to uninstall domain controller $COMPUTERNAME"
+            Throw "Failed to uninstall domain controller $COMPUTER_NAME"
         }
         return $stat
-    } -RetryMessage "Failed to uninstall the AD domain controller $COMPUTERNAME"
+    } -RetryMessage "Failed to uninstall the AD domain controller $COMPUTER_NAME"
 
     Close-ADDCPorts
 
@@ -1004,12 +1002,12 @@ function Remove-UnitFromDomain {
 
     $cfg = Get-JujuCharmConfig
     $adminName = Get-AdministratorAccount
-    $localAdmin = "{0}\{1}" -f @($COMPUTERNAME, $adminName)
+    $localAdmin = "{0}\{1}" -f @($COMPUTER_NAME, $adminName)
     $adminSecurePass = ConvertTo-SecureString $cfg['administrator-password'] -AsPlainText -Force
     $localCreds = New-Object PSCredential($localAdmin, $adminSecurePass)
 
     # Join the default WORKGROUP
-    Remove-Computer -Credential $localCreds -WorkgroupName "WORKGROUP" -ComputerName $COMPUTERNAME -Force -Confirm:$false | Out-Null
+    Remove-Computer -Credential $localCreds -WorkgroupName "WORKGROUP" -ComputerName $COMPUTER_NAME -Force -Confirm:$false | Out-Null
 }
 
 # TODO: Move to another module or create subordiante charm
@@ -1058,24 +1056,6 @@ function Install-ADCertificationAuthority {
     Restart-Service "CertSvc" -Force
 
     return (Get-ADCertificationAuthority -CAName $CAName)
-}
-
-# TODO: This doesn't scale out at the moment. More implementation needed
-#       to provide high availability of AD certificate service.
-#       Move to another module or create subordiante charm.
-function Set-ADCertificationAuthority {
-    Install-WindowsFeature 'AD-Certificate' -IncludeManagementTools
-
-    $cfg = Get-JujuCharmConfig
-    $mainDCIP = Get-LeaderData -Attribute 'main-domain-controller'
-    $privateIP = Get-JujuUnitPrivateIP
-    $caCertificates = Get-ADCertificationAuthority -CAName $cfg['ca-common-name']
-
-    if(!$caCertificates) {
-        if ($mainDCIP -eq $privateIP) {
-            Install-ADCertificationAuthority -CAName $cfg['ca-common-name'] | Out-Null
-        }
-    }
 }
 
 # NOTE(ibalutoiu): This function is deprecated and it will be removed in the future.
@@ -1273,7 +1253,27 @@ function Start-TransferFSMORoles {
     Write-JujuWarning 'FSMO roles transferred'
 }
 
-function Set-NodesKCD {
+function Set-ConstraintsDelegation {
+    Param(
+        [Parameter(Mandatory=$true)]
+        [string]$TrustedComputer,
+        [Parameter(Mandatory=$true)]
+        [string]$TrustingComputer,
+        [Parameter(Mandatory=$true)]
+        [string]$ServiceType,
+        [ValidateSet("Add", "Replace", "Remove")]
+        [string]$Action
+    )
+
+    $params = @{
+        $Action = @{
+            "msDS-AllowedToDelegateTo" = @("$ServiceType/$TrustingComputer","$ServiceType/$TrustingComputer.$env:UserDnsDomain")
+        }
+    }
+    Get-ADComputer $TrustedComputer | Set-ADObject @params
+}
+
+function Set-UnitsConstraintsDelegations {
     Param(
         [Parameter(Mandatory=$true)]
         [String]$RelationId,
@@ -1282,46 +1282,92 @@ function Set-NodesKCD {
     )
 
     $marshaledConstraints = $null
-    $computerNames = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
-
-    $marshaledConstraints = $null
-    $computerNames = [System.Collections.Generic.List[string]](New-Object "System.Collections.Generic.List[string]")
+    $unitsComputerNames = @{}
     foreach($unit in $Units) {
         $data = Get-JujuRelation -RelationId $RelationId -Unit $unit
         $marshaledConstraints = $data["constraints"]
         $compName = $data["computername"]
         if($compName) {
-            $computerNames.Add($compName)
+            $unitsComputerNames[$unit] = $compName
         }
     }
-
     if(!$marshaledConstraints) {
         Write-JujuWarning "Remote charm didn't set any constraints delegations to be set by AD"
         return
     }
-
-    if(!$computerNames) {
+    if(!$unitsComputerNames.Count) {
         Write-JujuWarning "No computers names set for the relation: $RelationId"
         return
     }
-
     $constraints = Get-UnmarshaledObject $marshaledConstraints
-
-    Write-JujuWarning ("Setting constraints delegations {0} for the computers: {1}" -f @(($constraints -join ', '), ($computerNames -join ', ')))
-
-    $kcdScript = Join-Path (Get-JujuCharmDir) "hooks\Set-KCD.ps1"
-    foreach($node1 in $computerNames) {
-        foreach($node2 in $computerNames) {
-            if ($node1 -eq $node2) {
-                continue
+    $leaderData = Get-LeaderData
+    $unitsWithConstraints = @{}
+    $unitsToSetConstraints = @{}
+    foreach($unit in $Units) {
+        $compName = $leaderData["constraints-${RelationId}-${unit}"]
+        if($compName) {
+            $unitsWithConstraints[$unit] = $compName
+            continue
+        }
+        if($unitsComputerNames[$unit]) {
+            $unitsToSetConstraints[$unit] = $unitsComputerNames[$unit]
+        }
+    }
+    try {
+        $leaderSettings = @{}
+        foreach($unit in $unitsToSetConstraints.Keys) {
+            $compName = $unitsToSetConstraints[$unit]
+            [array]$computerNamesWithConstraints = $unitsWithConstraints.Values
+            $msg = "Setting constraints delegations {0} between computer {1} and computers {1}" -f @(($constraints -join ', '),
+                                                                                                     $compName,
+                                                                                                     ($computerNamesWithConstraints -join ', '))
+            Write-JujuWarning $msg
+            foreach($c in $computerNamesWithConstraints) {
+                foreach($constraint in $constraints) {
+                    Set-ConstraintsDelegation -TrustedComputer $c -TrustingComputer $compName -ServiceType $constraint -Action "Add"
+                    Set-ConstraintsDelegation -TrustedComputer $compName -TrustingComputer $c -ServiceType $constraint -Action "Add"
+                }
             }
-            foreach($constraint in $constraints) {
-                Start-ExternalCommand { & $kcdScript $node1 $node2 -ServiceType $constraint }
-            }
+            $unitsWithConstraints[$unit] = $compName
+            $leaderSettings["constraints-${RelationId}-${unit}"] = $compName
+        }
+    } finally {
+        if($leaderSettings.Count) {
+            Set-LeaderData -Settings $leaderSettings
         }
     }
 }
 
+function Clear-ComputerConstraintsDelegations {
+    Param(
+        [Parameter(Mandatory=$true)]
+        [String]$RelationId,
+        [Parameter(Mandatory=$true)]
+        [string]$RemoteUnit,
+        [Parameter(Mandatory=$true)]
+        [string]$CompName,
+        [Parameter(Mandatory=$true)]
+        [string[]]$Constraints
+    )
+
+    $leaderData = Get-LeaderData
+    $unitsWithConstraints = @{}
+    $units = Get-JujuRelatedUnits -RelationId $RelationId
+    foreach($unit in $units) {
+        $name = $leaderData["constraints-${RelationId}-${unit}"]
+        if($name) {
+            $unitsWithConstraints[$unit] = $name
+        }
+    }
+    [array]$computerNamesWithConstraints = $unitsWithConstraints.Values
+    foreach($c in $computerNamesWithConstraints) {
+        foreach($constraint in $Constraints) {
+            Set-ConstraintsDelegation -TrustedComputer $CompName -TrustingComputer $c -ServiceType $constraint -Action "Remove"
+            Set-ConstraintsDelegation -TrustedComputer $c -TrustingComputer $CompName -ServiceType $constraint -Action "Remove"
+        }
+    }
+    Set-LeaderData -Settings @{"constraints-${RelationId}-${RemoteUnit}" = $null}
+}
 
 
 # HOOKS METHODS
@@ -1375,11 +1421,10 @@ function Invoke-InstallHook {
     }
 
     Install-ADForest
-    Set-ADCertificationAuthority
     Restore-DefaultResolvers
     Open-ADDCPorts
 
-    Set-JujuStatus -Status "active"
+    Set-JujuStatus -Status "active" -Message "Unit is ready"
 }
 
 function Invoke-LeaderElectedHook {
@@ -1418,7 +1463,7 @@ function Invoke-StopHook {
         Uninstall-ADDC
     }
 
-    $isCollocatedCharm = Get-IsAnotherCharmCollocated -CurrentComputerName $COMPUTERNAME
+    $isCollocatedCharm = Get-IsAnotherCharmCollocated -CurrentComputerName $COMPUTER_NAME
     if($isCollocatedCharm) {
         Write-JujuWarning "Machine still needs to be joined to AD"
         return
@@ -1427,7 +1472,7 @@ function Invoke-StopHook {
     # TODO(ibalutoiu): This must be done by other peer units in order to have
     #                  the computer deleted from AD even when the current
     #                  unit is brutally killed.
-    $computerObject = Get-ADComputer -Filter {Name -eq $COMPUTERNAME}
+    $computerObject = Get-ADComputer -Filter {Name -eq $COMPUTER_NAME}
     if($computerObject) {
         # TODO(ibalutoiu): Create separate functions to get domain administrator account name or local administrator account name.
         #                  Sometimes, function 'Get-AdministratorAccount' may return an array with both the names for local administrator and domain administrator.
@@ -1436,7 +1481,7 @@ function Invoke-StopHook {
         $cfg = Get-JujuCharmConfig
         $domainCredential = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
 
-        Write-JujuWarning "Removing $COMPUTERNAME from AD domain"
+        Write-JujuWarning "Removing $COMPUTER_NAME from AD domain"
         Remove-ADObject -Identity $computerObject -Recursive -Confirm:$false -Credential $domainCredential | Out-Null
     }
 
@@ -1465,7 +1510,7 @@ function Invoke-ADJoinRelationChangedHook {
             $relationSettings = New-ADJoinRelationData -RelationId $rid -Unit $unit
             Set-JujuRelation -RelationId $rid -Settings $relationSettings
         }
-        Set-NodesKCD -RelationId $rid -Units $units
+        Set-UnitsConstraintsDelegations -RelationId $rid -Units $units
     }
 }
 
@@ -1475,27 +1520,22 @@ function Invoke-ADJoinRelationDepartedHook {
         Write-JujuWarning "AD forest is not yet installed. Skipping the rest of the hook"
         return
     }
-
     if (!(Confirm-Leader)) {
         Write-JujuWarning "Unit is not leader. Skipping the rest of the hook"
         return
     }
-
     $relationData = Get-JujuRelation
-
     $compName = $relationData['computername']
     if (!$compName) {
         Write-JujuWarning "Remote unit didn't set computername"
         return
     }
-
     # Remove computer from the AD domain
     $blobName = ("djoin-" + $compName)
     $blob = Get-LeaderData -Attribute $blobName
     if(!$blob) {
         return
     }
-
     # Check if there is another collocated charm joined to the AD domain. If
     # so, we don't need to remove the machine from AD.
     $currentRelationId = Get-JujuRelationId
@@ -1505,7 +1545,6 @@ function Invoke-ADJoinRelationDepartedHook {
         Write-JujuWarning "Computer $CurrentComputerName needs to be joined to AD"
         return
     }
-
     if($relationData['service-accounts']) {
         $serviceAccounts = Get-UnmarshaledObject $relationData['service-accounts']
         foreach($service in $serviceAccounts.Keys) {
@@ -1515,13 +1554,18 @@ function Invoke-ADJoinRelationDepartedHook {
             }
         }
     }
-
     $computerObject = Get-ADComputer -Filter {Name -eq $compName}
     if($computerObject) {
+        $marshaledConstraints = Get-JujuRelation -Attribute "constraints"
+        if($marshaledConstraints) {
+            $remoteUnit = Get-JujuRemoteUnit
+            $constraints = Get-UnmarshaledObject $marshaledConstraints
+            Clear-ComputerConstraintsDelegations -RelationId $currentRelationId -RemoteUnit $remoteUnit `
+                                                 -CompName $compName -Constraints $constraints
+        }
         Write-JujuWarning "Removing $compName form AD domain"
         $computerObject | Remove-ADObject -Recursive -Confirm:$false
     }
-
     Set-LeaderData -Settings @{$blobName = $null}
     $blobFile = Join-Path $DJOIN_BLOBS_DIR ($compName + ".txt")
     if(Test-Path $blobFile) {
@@ -1551,11 +1595,10 @@ function Invoke-ADPeerRelationChangedHook {
     }
 
     Start-DomainControllerPromotion
-    Set-ADCertificationAuthority
     Restore-DefaultResolvers
     Open-ADDCPorts
 
-    Set-JujuStatus -Status "active"
+    Set-JujuStatus -Status "active" -Message "Unit is ready"
 }
 
 function Invoke-ADDNSRelationChangedHook {
@@ -1630,7 +1673,7 @@ function Invoke-UpdateStatusHook {
     $rids = Get-JujuRelationIds -Relation 'ad-peer'
 
     $computerNames = @(
-        $COMPUTERNAME)
+        $COMPUTER_NAME)
     foreach($rid in $rids) {
         $units = Get-JujuRelatedUnits -RelationId $rid
         foreach($unit in $units) {
@@ -1642,7 +1685,8 @@ function Invoke-UpdateStatusHook {
         }
     }
 
-    [array]$ADDomainControllers = Get-ADDomainController -Credential $domainCreds
+    [array]$ADDomainControllers = Start-ExecuteWithRetry { Get-ADDomainController -Credential $domainCreds } -MaxRetryCount 30 -RetryInterval 10 `
+                                        -RetryMessage "Failed to get AD domain controllers. Probably domain controller is not yet initialized. Retrying..."
     [array]$FSMOComputers = (Get-FSMORoles).Values
     $ADDomain = Get-CharmDomain
     $FSMOTransferNeeded = $false
@@ -1666,5 +1710,4 @@ function Invoke-UpdateStatusHook {
     foreach($computer in $ComputersToRemove){
         Remove-ADComputerFromADForest -Computer $computer
     }
-
 }

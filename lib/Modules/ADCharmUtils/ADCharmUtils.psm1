@@ -19,9 +19,6 @@ Import-Module JujuHooks
 Import-Module JujuLogging
 
 
-$COMPUTERNAME = [System.Net.Dns]::GetHostName()
-
-
 function Confirm-IsInDomain {
     Param(
         [Parameter(Mandatory=$true)]
@@ -31,7 +28,6 @@ function Confirm-IsInDomain {
     $currentDomain = (Get-ManagementObject -Class Win32_ComputerSystem).Domain.ToLower()
     $comparedDomain = ($WantedDomain).ToLower()
     $inDomain = $currentDomain.Equals($comparedDomain)
-
     return $inDomain
 }
 
@@ -43,7 +39,6 @@ function Grant-PrivilegesOnDomainUser {
 
     $administratorsGroupSID = "S-1-5-32-544"
     Add-UserToLocalGroup -Username $Username -GroupSID $administratorsGroupSID
-
     Grant-Privilege $Username SeServiceLogonRight
 }
 
@@ -101,22 +96,23 @@ function Get-MyADCredentials {
 }
 
 function Get-ActiveDirectoryContext {
-    $blobKey = ("djoin-" + $COMPUTERNAME)
+    if($global:JUJU_AD_RELATION_CONTEXT) {
+        return $global:JUJU_AD_RELATION_CONTEXT
+    }
+    $blobKey = ("djoin-" + [System.Net.Dns]::GetHostName())
     $requiredCtx = @{
-        "already-joined-$COMPUTERNAME" = $null
+        "already-joined-${env:COMPUTERNAME}" = $null
         "address" = $null
         "username" = $null
         "password" = $null
         "domainName" = $null
         "netbiosname" = $null
     }
-
     $optionalContext = @{
         $blobKey = $null
         "adcredentials" = $null
     }
     $ctx = Get-JujuRelationContext -Relation "ad-join" -RequiredContext $requiredCtx -OptionalContext $optionalContext
-
     # Required context not found
     if(!$ctx.Count) {
         return @{}
@@ -124,10 +120,9 @@ function Get-ActiveDirectoryContext {
     # A node may be added to an active directory domain outside of Juju, or it may be added by another charm colocated.
     # If another charm adds the computer to AD, we still get back a djoin_blob, but if we manually add a computer, the
     # djoin blob will be empty. That is the reason we make the djoin blob optional.
-    if(($ctx["already-joined-$COMPUTERNAME"] -eq $false) -and !$ctx[$blobKey]) {
+    if(($ctx["already-joined-${env:COMPUTERNAME}"] -eq $false) -and !$ctx[$blobKey]) {
         return @{}
     }
-
     # replace the djoin data key with something less dynamic
     $djoinData = $ctx[$blobKey]
     $ctx.Remove($blobKey)
@@ -142,6 +137,7 @@ function Get-ActiveDirectoryContext {
             $ctx["adcredentials"] = $null
         }
     }
+    Set-Variable -Name "JUJU_AD_RELATION_CONTEXT" -Value $ctx -Scope Global -Option ReadOnly
     return $ctx
 }
 
@@ -150,43 +146,53 @@ function Invoke-DJoin {
         [Parameter(Mandatory=$true)]
         [String]$DCAddress,
         [Parameter(Mandatory=$true)]
-        [String]$DJoinBlob
+        [String]$DJoinBlob,
+        [Parameter(Mandatory=$true)]
+        [String]$DomainName
     )
 
+    if (Confirm-IsInDomain $DomainName) {
+        Write-JujuWarning "Domain $DomainName is already joined"
+        return
+    }
     Write-JujuWarning "Started join domain"
-
-    $networkName = (Get-MainNetadapter)
-    Set-DnsClientServerAddress -InterfaceAlias $networkName -ServerAddresses $DCAddress
+    Set-DnsClientServerAddress -InterfaceAlias * -ServerAddresses $DCAddress
+    Set-DnsClientGlobalSetting -SuffixSearchList @($DomainName)
     $cmd = @("ipconfig", "/flushdns")
     Invoke-JujuCommand -Command $cmd
-
     $blobFile = Join-Path $env:TMP "djoin-blob.txt"
-    Write-FileFromBase64 -File $blobFile -Content $Params["djoin_blob"]
+    Write-FileFromBase64 -File $blobFile -Content $DJoinBlob
     $cmd = @("djoin.exe", "/requestODJ", "/loadfile", $blobFile, "/windowspath", $env:SystemRoot, "/localos")
     Invoke-JujuCommand -Command $cmd
     Invoke-JujuReboot -Now
 }
 
+function Get-DomainJoinPendingReboot {
+    $netlogon = "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon"
+    # Query Netlogon from the registry. These keys are present if there is a
+    # pending reboot from a domain join operation.
+    if((Test-Path "$netlogon\JoinDomain") -or (Test-Path "$netlogon\AvoidSpnSet")) {
+        return $true
+    }
+    return $false
+}
+
 function Start-JoinDomain {
+    $pendingReboot = Get-DomainJoinPendingReboot
+    if($pendingReboot) {
+        Invoke-JujuReboot -Now
+    }
     $adCtxt = Get-ActiveDirectoryContext
     if (!$adCtxt.Count) {
         Write-JujuWarning "ad-join relation context is empty"
         return $false
     }
-
-    $fqdn = (Get-CimInstance -ClassName Win32_ComputerSystem).Domain.ToLower()
-    if($fqdn -ne $adCtxt["domainName"]){
-        Throw ("We appear to be part of the wrong domain. " +
-               "Expected: {0}, We are in domain: {1}" -f @($adCtxt["domainName"], $fqdn))
-    }
-
     if (!(Confirm-IsInDomain $adCtxt['domainName'])) {
-        if (!$adCtxt["djoin_blob"] -and $adCtxt["already-joined-$COMPUTERNAME"]) {
+        if (!$adCtxt["djoin_blob"] -and $adCtxt["already-joined-${env:COMPUTERNAME}"]) {
             Throw "The domain controller reports that a computer with the same hostname as this unit is already added to the domain, and we did not get any domain join information."
         }
-        Invoke-DJoin -DCAddress $adCtxt['address'] -DJoinBlob $adCtxt['djoin_blob']
+        Invoke-DJoin -DCAddress $adCtxt['address'] -DJoinBlob $adCtxt['djoin_blob'] -DomainName $adCtxt['domainName']
     }
-
     return $true
 }
 
@@ -199,42 +205,34 @@ function Rename-JujuUnit {
     #>
 
     $cfg = Get-JujuCharmConfig
+    if(!$cfg['change-hostname']) {
+        return $false
+    }
+    $changedHostname = Get-CharmState -Namespace "Common" -Key "ChangedHostname"
+    $computerName = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName").ComputerName
+    if($changedHostname) {
+        $activeComputerName = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName").ComputerName
+        if($computerName -ne $activeComputerName) {
+            Write-JujuWarning "Hostname changed but the computer was not yet rebooted"
+            return $true
+        }
+        return $false
+    }
     $newName = Convert-JujuUnitNameToNetbios
-    $hostnameChanged = Get-CharmState -Namespace "Common" -Key "HostnameChanged"
-    $renameReboot = $false
-
-    if ($cfg['change-hostname'] -and !$hostnameChanged -and ($COMPUTERNAME -ne $newName)) {
-        Write-JujuWarning ("Changing computername from {0} to {1}" -f @($COMPUTERNAME, $newName))
-
+    if ($newName -ne $computerName) {
+        Write-JujuWarning ("Changing computername from {0} to {1}" -f @($computerName, $newName))
         Rename-Computer -NewName $newName | Out-Null
-        Set-CharmState -Namespace "Common" -Key "HostnameChanged" -Value $true
-        $renameReboot = $true
+        Set-CharmState -Namespace "Common" -Key "ChangedHostname" -Value $newName
+        return $true
     }
-
-    return $renameReboot
+    return $false
 }
 
-function Invoke-CommandAsADUser {
-    Param(
-        [Parameter(Mandatory=$true)]
-        [ScriptBlock]$ScriptBlock,
-        [Parameter(Mandatory=$true)]
-        [String]$Domain,
-        [Parameter(Mandatory=$true)]
-        [String]$User,
-        [Parameter(Mandatory=$true)]
-        [String]$Password
-    )
-
-    Grant-Privilege -User $User -Grant "SeServiceLogonRight"
-
-    $domainUser = "{0}\{1}" -f @($Domain, $User)
-    $securePass = ConvertTo-SecureString $Password -AsPlainText -Force
-    $domainCredential = New-Object System.Management.Automation.PSCredential($domainUser, $securePass)
-
-    $exitCode = Start-ProcessAsUser -Command "$PShome\powershell.exe" -Arguments @("-Command", $ScriptBlock) `
-                                    -Credential $domainCredential -LoadUserProfile $false
-    if($exitCode) {
-        Throw "Failed to execute command as AD user. Exit code: $exitCode"
-    }
-}
+Export-ModuleMember -Function @(
+    'Confirm-IsInDomain',
+    'Grant-PrivilegesOnDomainUser',
+    'Get-NewCimSession',
+    'Get-ActiveDirectoryContext',
+    'Rename-JujuUnit',
+    'Start-JoinDomain'
+)

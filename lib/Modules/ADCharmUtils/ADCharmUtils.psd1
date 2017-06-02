@@ -45,6 +45,24 @@ Description = 'Utilities for active directory charm'
 # Minimum version of the Windows PowerShell engine required by this module
 PowerShellVersion = '3.0'
 
-FunctionsToExport = '*'
+# Functions to export from this module
+FunctionsToExport = @(
+    'Confirm-IsInDomain',
+    'Grant-PrivilegesOnDomainUser',
+    'Get-NewCimSession',
+    'Get-ActiveDirectoryContext',
+    'Rename-JujuUnit',
+    'Start-JoinDomain',
+    'Invoke-CommandAsDifferentUser'
+)
+
+# Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
+CmdletsToExport = @()
+
+# Variables to export from this module
+VariablesToExport = @()
+
+# Aliases to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no aliases to export.
+AliasesToExport = @()
 
 }
