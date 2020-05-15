@@ -24,6 +24,7 @@ options:
       described at: https://technet.microsoft.com/en-us/library/cc786468(v=ws.10).aspx
   domain-user:
     type: string
+    default: 'jujuadmin'
     description: |
       The default domain user that will be exposed by the Active Directory charm relation.
       It can be used by the charms that are in relation to connect to the
@@ -38,6 +39,7 @@ options:
       described at: https://technet.microsoft.com/en-us/library/cc786468(v=ws.10).aspx
   domain-name:
     type: string
+    default: 'cloudbase.local'
     description: |
       The Active Directory fully quallyfied domain name.
       This value is required vor the Active Directory installation.
