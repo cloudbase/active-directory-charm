@@ -13,17 +13,32 @@
 #    under the License.
 #
 
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$assemblies = Join-Path $here "Load-Assemblies.ps1"
+
+if (Test-Path $assemblies) {
+    . $here\Load-Assemblies.ps1
+}
+
 function Get-YamlDocuments {
     [CmdletBinding()]
     Param(
         [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
-        [string]$Yaml
+        [string]$Yaml,
+        [switch]$UseMergingParser=$false
     )
     PROCESS {
         $stringReader = new-object System.IO.StringReader($Yaml)
+        $parser = New-Object "YamlDotNet.Core.Parser" $stringReader
+        if($UseMergingParser) {
+            $parser = New-Object "YamlDotNet.Core.MergingParser" $parser
+        }
+
         $yamlStream = New-Object "YamlDotNet.RepresentationModel.YamlStream"
-        $yamlStream.Load([System.IO.TextReader] $stringReader)
+        $yamlStream.Load([YamlDotNet.Core.IParser] $parser)
+
         $stringReader.Close()
+
         return $yamlStream
     }
 }
@@ -32,21 +47,52 @@ function Convert-ValueToProperType {
     [CmdletBinding()]
     Param(
         [Parameter(Mandatory=$true,ValueFromPipeline=$true)]
-        [System.Object]$Value
+        [System.Object]$Node
     )
     PROCESS {
-        if (!($Value -is [string])) {
-            return $Value
+        if (!($Node.Value -is [string])) {
+            return $Node
         }
-        $types = @([int], [long], [double], [boolean], [datetime])
-        foreach($i in $types){
-            try {
-                return $i::Parse($Value)
-            } catch {
-                continue
+        
+        if ($Node.Style -eq 'Plain')
+        {
+            $types = @([int], [long], [double], [boolean], [decimal])
+            foreach($i in $types){
+                $parsedValue = New-Object -TypeName $i.FullName
+                if ($i.IsAssignableFrom([boolean])){
+                    $result = $i::TryParse($Node,[ref]$parsedValue) 
+                } else {
+                    $result = $i::TryParse($Node, [Globalization.NumberStyles]::Any, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsedValue)
+                }
+                if( $result ) {
+                    return $parsedValue
+                }
             }
         }
-        return $Value
+        # From the YAML spec: http://yaml.org/type/timestamp.html
+        $regex = @'
+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] # (ymd)
+|[0-9][0-9][0-9][0-9] # (year)
+ -[0-9][0-9]? # (month)
+ -[0-9][0-9]? # (day)
+ ([Tt]|[ \t]+)[0-9][0-9]? # (hour)
+ :[0-9][0-9] # (minute)
+ :[0-9][0-9] # (second)
+ (\.[0-9]*)? # (fraction)
+ (([ \t]*)Z|[-+][0-9][0-9]?(:[0-9][0-9])?)? # (time zone)
+'@
+        if([Text.RegularExpressions.Regex]::IsMatch($Node.Value, $regex, [Text.RegularExpressions.RegexOptions]::IgnorePatternWhitespace) ) {
+            [DateTime]$datetime = [DateTime]::MinValue
+            if( ([DateTime]::TryParse($Node.Value,[ref]$datetime)) ) {
+                return $datetime
+            }
+        }
+
+        if ($Node.Style -eq 'Plain' -and $Node.Value -in '','~','null','Null','NULL') {
+            return $null
+        }
+
+        return $Node.Value
     }
 }
 
@@ -54,12 +100,13 @@ function Convert-YamlMappingToHashtable {
     [CmdletBinding()]
     Param(
         [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
-        [YamlDotNet.RepresentationModel.YamlMappingNode]$Node
+        [YamlDotNet.RepresentationModel.YamlMappingNode]$Node,
+        [switch] $Ordered
     )
     PROCESS {
-        $ret = @{}
+        if ($Ordered) { $ret = [ordered]@{} } else { $ret = @{} }
         foreach($i in $Node.Children.Keys) {
-            $ret[$i.Value] = Convert-YamlDocumentToPSObject $Node.Children[$i]
+            $ret[$i.Value] = Convert-YamlDocumentToPSObject $Node.Children[$i] -Ordered:$Ordered
         }
         return $ret
     }
@@ -69,14 +116,15 @@ function Convert-YamlSequenceToArray {
     [CmdletBinding()]
     Param(
         [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
-        [YamlDotNet.RepresentationModel.YamlSequenceNode]$Node
+        [YamlDotNet.RepresentationModel.YamlSequenceNode]$Node,
+        [switch]$Ordered
     )
     PROCESS {
         $ret = [System.Collections.Generic.List[object]](New-Object "System.Collections.Generic.List[object]")
         foreach($i in $Node.Children){
-            $ret.Add((Convert-YamlDocumentToPSObject $i))
+            $ret.Add((Convert-YamlDocumentToPSObject $i -Ordered:$Ordered))
         }
-        return $ret
+        return ,$ret
     }
 }
 
@@ -84,18 +132,19 @@ function Convert-YamlDocumentToPSObject {
     [CmdletBinding()]
     Param(
         [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
-        [System.Object]$Node
+        [System.Object]$Node, 
+        [switch]$Ordered
     )
     PROCESS {
         switch($Node.GetType().FullName){
             "YamlDotNet.RepresentationModel.YamlMappingNode"{
-                return Convert-YamlMappingToHashtable $Node
+                return Convert-YamlMappingToHashtable $Node -Ordered:$Ordered
             }
             "YamlDotNet.RepresentationModel.YamlSequenceNode" {
-                return Convert-YamlSequenceToArray $Node
+                return Convert-YamlSequenceToArray $Node -Ordered:$Ordered
             }
             "YamlDotNet.RepresentationModel.YamlScalarNode" {
-                return (Convert-ValueToProperType $Node.Value)
+                return (Convert-ValueToProperType $Node)
             }
         }
     }
@@ -112,15 +161,27 @@ function Convert-HashtableToDictionary {
     return $Data
 }
 
-function Convert-ListToGenericList {
+function Convert-OrderedHashtableToDictionary {
     Param(
         [Parameter(Mandatory=$true,ValueFromPipeline=$true)]
-        [array]$Data
+        [System.Collections.Specialized.OrderedDictionary] $Data
     )
-    for($i=0; $i -lt $Data.Count; $i++) {
+    foreach ($i in $($data.Keys)) {
         $Data[$i] = Convert-PSObjectToGenericObject $Data[$i]
     }
-    return ,$Data
+    return $Data
+}
+
+function Convert-ListToGenericList {
+    Param(
+        [Parameter(Mandatory=$false,ValueFromPipeline=$true)]
+        [array]$Data=@()
+    )
+    $ret = [System.Collections.Generic.List[object]](New-Object "System.Collections.Generic.List[object]")
+    for($i=0; $i -lt $Data.Count; $i++) {
+        $ret.Add((Convert-PSObjectToGenericObject $Data[$i]))
+    }
+    return ,$ret
 }
 
 function Convert-PSCustomObjectToDictionary {
@@ -137,105 +198,220 @@ function Convert-PSCustomObjectToDictionary {
 
 function Convert-PSObjectToGenericObject {
     Param(
-        [Parameter(Mandatory=$true,ValueFromPipeline=$true)]
+        [Parameter(Mandatory=$false,ValueFromPipeline=$true)]
         [System.Object]$Data
     )
-    # explicitly cast object to its type. Without this, it gets wrapped inside a powershell object
-    # which causes YamlDotNet to fail
-    $data = $data -as $data.GetType().FullName
-    switch($data.GetType()) {
-        ($_.FullName -eq "System.Management.Automation.PSCustomObject") {
-            return Convert-PSCustomObjectToDictionary
-        }
-        default {
-            if (([System.Collections.IDictionary].IsAssignableFrom($_))){
-                return Convert-HashtableToDictionary $data
-            } elseif (([System.Collections.IList].IsAssignableFrom($_))) {
-                return Convert-ListToGenericList $data
-            }
-            return $data
-        }
+
+    if ($null -eq $data) {
+        return $data
     }
+
+    $dataType = $data.GetType()
+    if ($data -isnot [System.Object]) {
+        return $data -as $dataType
+    }
+
+    if ($dataType.FullName -eq "System.Management.Automation.PSCustomObject") {
+        return Convert-PSCustomObjectToDictionary $data
+    } elseif (([System.Collections.Specialized.OrderedDictionary].IsAssignableFrom($dataType))){
+        return Convert-OrderedHashtableToDictionary $data
+    } elseif (([System.Collections.IDictionary].IsAssignableFrom($dataType))){
+        return Convert-HashtableToDictionary $data
+    } elseif (([System.Collections.IList].IsAssignableFrom($dataType))) {
+        return Convert-ListToGenericList $data
+    }
+    return $data -as $dataType
 }
 
 function ConvertFrom-Yaml {
     [CmdletBinding()]
     Param(
-        [Parameter(Mandatory=$false, ValueFromPipeline=$true)]
+        [Parameter(Mandatory=$false, ValueFromPipeline=$true, Position=0)]
         [string]$Yaml,
-        [switch]$AllDocuments=$false
+        [switch]$AllDocuments=$false,
+        [switch]$Ordered,
+        [switch]$UseMergingParser=$false
     )
+
+    BEGIN {
+        $d = ""
+    }
     PROCESS {
-        if(!$Yaml){
+        if($Yaml -is [string]) {
+            $d += $Yaml + "`n"
+        }
+    }
+
+    END {
+        if($d -eq ""){
             return
         }
-        $documents = Get-YamlDocuments -Yaml $Yaml
+        $documents = Get-YamlDocuments -Yaml $d -UseMergingParser:$UseMergingParser
         if (!$documents.Count) {
             return
         }
         if($documents.Count -eq 1){
-            return Convert-YamlDocumentToPSObject $documents[0].RootNode
+            return Convert-YamlDocumentToPSObject $documents[0].RootNode -Ordered:$Ordered
         }
         if(!$AllDocuments) {
-            return Convert-YamlDocumentToPSObject $documents[0].RootNode
+            return Convert-YamlDocumentToPSObject $documents[0].RootNode -Ordered:$Ordered
         }
         $ret = @()
         foreach($i in $documents) {
-            $ret += Convert-YamlDocumentToPSObject $i.RootNode
+            $ret += Convert-YamlDocumentToPSObject $i.RootNode -Ordered:$Ordered
         }
         return $ret
     }
 }
 
-function ConvertTo-Yaml {
-    [CmdletBinding()]
+$stringQuotingEmitterSource = @"
+using System;
+using System.Text.RegularExpressions;
+using YamlDotNet;
+using YamlDotNet.Core;
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.EventEmitters;
+public class StringQuotingEmitter: ChainedEventEmitter {
+    // Patterns from https://yaml.org/spec/1.2/spec.html#id2804356
+    private static Regex quotedRegex = new Regex(@`"^(\~|null|true|false|-?(0|[0-9][0-9]*)(\.[0-9]*)?([eE][-+]?[0-9]+)?)?$`", RegexOptions.Compiled);
+    public StringQuotingEmitter(IEventEmitter next): base(next) {}
+
+    public override void Emit(ScalarEventInfo eventInfo, IEmitter emitter) {
+        var typeCode = eventInfo.Source.Value != null
+        ? Type.GetTypeCode(eventInfo.Source.Type)
+        : TypeCode.Empty;
+
+        switch (typeCode) {
+            case TypeCode.Char:
+                if (Char.IsDigit((char)eventInfo.Source.Value)) {
+                    eventInfo.Style = ScalarStyle.DoubleQuoted;
+                }
+                break;
+            case TypeCode.String:
+                var val = eventInfo.Source.Value.ToString();
+                if (quotedRegex.IsMatch(val))
+                {
+                    eventInfo.Style = ScalarStyle.DoubleQuoted;
+                } else if (val.IndexOf('\n') > -1) {
+                    eventInfo.Style = ScalarStyle.Literal;
+                }
+                break;
+        }
+
+        base.Emit(eventInfo, emitter);
+    }
+
+    public static SerializerBuilder Add(SerializerBuilder builder) {
+        return builder.WithEventEmitter(next => new StringQuotingEmitter(next));
+    }
+}
+"@
+
+$referenceList = @([YamlDotNet.Serialization.Serializer].Assembly.Location,[Text.RegularExpressions.Regex].Assembly.Location)
+if ($PSVersionTable.PSEdition -eq "Core") {
+    Add-Type -TypeDefinition $stringQuotingEmitterSource -ReferencedAssemblies $referenceList -Language CSharp -CompilerOptions "-nowarn:1701"
+} else {
+    Add-Type -TypeDefinition $stringQuotingEmitterSource -ReferencedAssemblies $referenceList -Language CSharp
+}
+
+function Get-Serializer {
     Param(
-        [Parameter(Mandatory=$false,ValueFromPipeline=$true)]
+        [Parameter(Mandatory=$true)][YamlDotNet.Serialization.SerializationOptions]$Options
+    )
+    
+    $builder = New-Object "YamlDotNet.Serialization.SerializerBuilder"
+    
+    if ($Options.HasFlag([YamlDotNet.Serialization.SerializationOptions]::Roundtrip)) {
+        $builder = $builder.EnsureRoundtrip()
+    }
+    if ($Options.HasFlag([YamlDotNet.Serialization.SerializationOptions]::DisableAliases)) {
+        $builder = $builder.DisableAliases()
+    }
+    if ($Options.HasFlag([YamlDotNet.Serialization.SerializationOptions]::EmitDefaults)) {
+        $builder = $builder.EmitDefaults()
+    }
+    if ($Options.HasFlag([YamlDotNet.Serialization.SerializationOptions]::JsonCompatible)) {
+        $builder = $builder.JsonCompatible()
+    }
+    if ($Options.HasFlag([YamlDotNet.Serialization.SerializationOptions]::DefaultToStaticType)) {
+        $builder = $builder.WithTypeResolver((New-Object "YamlDotNet.Serialization.TypeResolvers.StaticTypeResolver"))
+    }
+    $builder = [StringQuotingEmitter]::Add($builder)
+    return $builder.Build()
+}
+
+function ConvertTo-Yaml {
+    [CmdletBinding(DefaultParameterSetName = 'NoOptions')]
+    Param(
+        [Parameter(ValueFromPipeline = $true, Position=0)]
         [System.Object]$Data,
-        [Parameter(Mandatory=$false)]
+
         [string]$OutFile,
-        [switch]$Force=$false
+
+        [Parameter(ParameterSetName = 'Options')]
+        [YamlDotNet.Serialization.SerializationOptions]$Options = [YamlDotNet.Serialization.SerializationOptions]::Roundtrip,
+
+        [Parameter(ParameterSetName = 'NoOptions')]
+        [switch]$JsonCompatible,
+
+        [switch]$Force
     )
     BEGIN {
         $d = [System.Collections.Generic.List[object]](New-Object "System.Collections.Generic.List[object]")
     }
     PROCESS {
-        if($data -ne $null) {
+        if($data -is [System.Object]) {
             $d.Add($data)
         }
     }
     END {
-        if($d -eq $null -or $d.Count -eq 0){
+        if ($d -eq $null -or $d.Count -eq 0) {
             return
         }
-        if($d.Count -eq 1) {
+        if ($d.Count -eq 1) {
             $d = $d[0]
         }
         $norm = Convert-PSObjectToGenericObject $d
-        if($OutFile) {
+        if ($OutFile) {
             $parent = Split-Path $OutFile
-            if(!(Test-Path $parent)) {
+            if (!(Test-Path $parent)) {
                 Throw "Parent folder for specified path does not exist"
             }
-            if((Test-Path $OutFile) -and !$Force){
+            if ((Test-Path $OutFile) -and !$Force) {
                 Throw "Target file already exists. Use -Force to overwrite."
             }
             $wrt = New-Object "System.IO.StreamWriter" $OutFile
         } else {
             $wrt = New-Object "System.IO.StringWriter"
         }
+    
+        if ($PSCmdlet.ParameterSetName -eq 'NoOptions') {
+            $Options = 0
+            if ($JsonCompatible) {
+                # No indent options :~(
+                $Options = [YamlDotNet.Serialization.SerializationOptions]::JsonCompatible
+            }
+        }
+
         try {
-            $serializer = New-Object "YamlDotNet.Serialization.Serializer" 0
+            $serializer = Get-Serializer $Options
             $serializer.Serialize($wrt, $norm)
-        } finally {
+        }
+        catch{
+            $_
+        }
+        finally {
             $wrt.Close()
         }
-        if($OutFile){
+        if ($OutFile) {
             return
-        }else {
+        } else {
             return $wrt.ToString()
         }
     }
 }
+
+New-Alias -Name cfy -Value ConvertFrom-Yaml
+New-Alias -Name cty -Value ConvertTo-Yaml
 
 Export-ModuleMember -Function * -Alias *
