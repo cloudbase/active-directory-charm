@@ -21,7 +21,6 @@ Import-Module JujuWindowsUtils
 $COMPUTER_NAME = [System.Net.Dns]::GetHostName()
 $DJOIN_BLOBS_DIR = Join-Path $env:TEMP "blobs"
 
-
 function Save-DefaultResolvers {
     <#
     .SYNOPSIS
@@ -77,7 +76,9 @@ function Add-DNSForwarders {
 
     # Reset DNS server forwarders
     $cmd = @("dnscmd.exe", $COMPUTER_NAME, "/resetforwarders")
-    Invoke-JujuCommand -Command $cmd | Out-Null
+    Start-ExecuteWithRetry {
+        Invoke-JujuCommand -Command $cmd | Out-Null
+    } -MaxRetryCount 30 -RetryInterval 10
 
     Import-Module DnsServer
 
@@ -212,21 +213,23 @@ function Get-DomainAdminCredentials {
     if ((Confirm-IsInDomain $charmDomain) -eq $false) {
         return $false
     }
+    $adminCreds = Get-ADAdminCredentials
     # The function returns the SID of the domain administrator. After the reboot when
     # the AD forest is installed, it takes a while until AD is initialized. The following
     # function will give 404 until AD is ready, thus a retry is needed.
     [array]$adminNames = Start-ExecuteWithRetry -ScriptBlock { Get-AdministratorAccount } `
                                                -MaxRetryCount 30 -RetryInterval 10 `
                                                -RetryMessage "Failed to get Administrator account name. Probably AD is loading after reboot. Retrying..."
-    $cfg = Get-JujuCharmConfig
-    Add-WindowsUser $adminNames[0] $cfg['administrator-password']
 
-    $domainCreds = Get-DomainCredential -UserName $adminNames[0] -Password $cfg['administrator-password']
+    Add-WindowsUser $adminNames[0] $adminCreds['administrator-password']
+
+    $domainCreds = Get-DomainCredential -UserName $adminNames[0] -Password $adminCreds['administrator-password']
     return $domainCreds
 }
 
 function Install-ADForest {
     Write-JujuWarning "Installing AD Forest"
+    $adminCreds = Get-ADAdminCredentials
 
     # The function returns the SID of the domain administrator. After the reboot when
     # the AD forest is installed, it takes a while until AD is initialized. The following
@@ -239,18 +242,18 @@ function Install-ADForest {
     $charmDomain = Get-CharmDomain
     if (Confirm-IsInDomain $charmDomain) {
         Write-JujuWarning ("AD forest is already installed. Adding default domain user {0} to domain admin groups" -f @($cfg['domain-user']))
-        $domainCreds = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
+        $domainCreds = Get-DomainCredential -UserName $adminName -Password $adminCreds['administrator-password']
         Grant-DomainAdminPrivileges -User $cfg['domain-user'] -DomainCredential $domainCreds
         return
     }
 
     Write-JujuLog "Setting default administrator password"
-    Add-WindowsUser $adminName $cfg['administrator-password']
+    Add-WindowsUser $adminName $adminCreds['administrator-password']
 
     Write-JujuWarning ("Creating local admin for default domain user: {0}" -f @($cfg['domain-user']))
-    New-LocalAdmin -Username $cfg['domain-user'] -Password $cfg['domain-user-password']
+    New-LocalAdmin -Username $cfg['domain-user'] -Password $adminCreds['domain-user-password']
 
-    $safeModeSecurePass = ConvertTo-SecureString -String $cfg['safe-mode-password'] -AsPlainText -Force
+    $safeModeSecurePass = ConvertTo-SecureString -String $adminCreds['safe-mode-password'] -AsPlainText -Force
 
     $netbiosName = $charmDomain.Split('.')[0]
     $stat = Install-ADDSForest -DomainName $charmDomain -DomainNetbiosName $netbiosName `
@@ -461,33 +464,6 @@ function New-DJoinData {
     return $blob
 }
 
-function New-ADRelationServiceAccount {
-    Param(
-        [Parameter(Mandatory=$true)]
-        [System.String]$Name,
-        [Parameter(Mandatory=$true)]
-        [System.String[]]$AllowedPrincipals,
-        [Parameter(Mandatory=$true)]
-        [System.String[]]$Groups,
-        [Parameter(Mandatory=$true)]
-        [System.String]$Computer
-    )
-
-    $service = Get-ADServiceAccount -Filter * | Where-Object { $_.Name -eq $Name }
-    if(!$service) {
-        $domain = Get-CharmDomain
-        New-ADServiceAccount -Name $Name -Enabled $true -DNSHostName "${Name}.${domain}" `
-                             -PrincipalsAllowedToRetrieveManagedPassword $AllowedPrincipals
-    }
-    Add-ADComputerServiceAccount -Identity $Computer -ServiceAccount "${Name}$"
-    foreach($group in $Groups) {
-        $groupMember = Get-ADGroupMember -Identity $group | Where-Object { $_.SamAccountName -eq "${Name}$" }
-        if(!$groupMember) {
-            Add-ADGroupMember -Identity $group -Members "${Name}$"
-        }
-    }
-}
-
 function Get-RelationDjoin {
     Param(
         [Parameter(Mandatory=$true)]
@@ -518,6 +494,33 @@ function Get-RelationDjoin {
     return $ret
 }
 
+function New-ADRelationServiceAccount {
+    Param(
+        [Parameter(Mandatory=$true)]
+        [System.String]$Name,
+        [Parameter(Mandatory=$true)]
+        [System.String[]]$AllowedPrincipals,
+        [Parameter(Mandatory=$true)]
+        [System.String[]]$Groups,
+        [Parameter(Mandatory=$true)]
+        [System.String]$Computer
+    )
+
+    $service = Get-ADServiceAccount -Filter * | Where-Object { $_.Name -eq $Name }
+    if(!$service) {
+        $domain = Get-CharmDomain
+        New-ADServiceAccount -Name $Name -Enabled $true -DNSHostName "${Name}.${domain}" `
+                             -PrincipalsAllowedToRetrieveManagedPassword $AllowedPrincipals
+    }
+    Add-ADComputerServiceAccount -Identity $Computer -ServiceAccount "${Name}$"
+    foreach($group in $Groups) {
+        $groupMember = Get-ADGroupMember -Identity $group | Where-Object { $_.SamAccountName -eq "${Name}$" }
+        if(!$groupMember) {
+            Add-ADGroupMember -Identity $group -Members "${Name}$"
+        }
+    }
+}
+
 function New-ADRelationServiceAccounts {
     Param(
         [Parameter(Mandatory=$true)]
@@ -525,7 +528,7 @@ function New-ADRelationServiceAccounts {
         [Parameter(Mandatory=$true)]
         [String]$Computer
     )
-
+    $adminCreds = Get-ADAdminCredentials
     $kdsScriptBlock = {
         if(!(Get-KdsRootKey)) {
             Add-KdsRootKey -EffectiveTime (Get-Date).AddHours(-10)
@@ -534,7 +537,7 @@ function New-ADRelationServiceAccounts {
     $adminName = Get-AdministratorAccount
     $charmDomain = Get-CharmDomain
     Invoke-CommandAsADUser -ScriptBlock $kdsScriptBlock -Domain $charmDomain `
-                           -User $adminName -Password $cfg['administrator-password']
+                           -User $adminName -Password $adminCreds['administrator-password']
 
     foreach($service in $ServiceAccounts.Keys) {
         $properties = $ServiceAccounts[$service]
@@ -555,14 +558,14 @@ function New-ADJoinRelationData {
         [Parameter(Mandatory=$true)]
         [System.String]$Unit
     )
-
+    $adminCreds = Get-ADAdminCredentials
     $cfg = Get-JujuCharmConfig
     $domainInfo = Get-ADDomain
     $relationSettings = @{
         'address' = Get-JujuUnitPrivateIP
         'hostname' = $COMPUTER_NAME
         'username' = $cfg['domain-user']
-        'password' = $cfg['domain-user-password']
+        'password' = $adminCreds['domain-user-password']
         'domainName' = $domainInfo.Forest
         'suffix' = $domainInfo.DistinguishedName
         'netbiosname' = $domainInfo.NetBIOSName
@@ -576,7 +579,12 @@ function New-ADJoinRelationData {
     }
 
     if($relationData['users']) {
-        $adUsers = Get-UnmarshaledObject $relationData['users']
+        try {
+            $adUsers = Get-UnmarshaledObject $relationData['users']
+        } catch {
+            Write-JujuError "Failed to unmarshal user data: $_"
+            return $relationSettings
+        }
         $creds = New-ADRelationUsers -RelationUsers $adUsers -ContainerOU $ou
         $relationSettings["adcredentials"] = Get-MarshaledObject $creds
     } else {
@@ -808,6 +816,7 @@ function Get-IsDomainController {
     if (!(Confirm-IsInDomain $domain)) {
         return $false
     }
+    $adminCreds = Get-ADAdminCredentials
 
     # TODO(ibalutoiu): Create separate functions to get domain administrator account name or local administrator account name.
     #                  Sometimes, function 'Get-AdministratorAccount' may return an array with both the names for local administrator and domain administrator.
@@ -815,7 +824,7 @@ function Get-IsDomainController {
                                                 -RetryMessage "Failed to get Administrator account name. Probably AD is loading after reboot. Retrying..."
     $adminName = $adminNames[0]
     $cfg = Get-JujuCharmConfig
-    $domainCreds = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
+    $domainCreds = Get-DomainCredential -UserName $adminName -Password $adminCreds['administrator-password']
 
     $domainControllers = Start-ExecuteWithRetry {
         (Get-ADDomainController -Credential $domainCreds -Filter {Enabled -eq $true}).Name
@@ -833,19 +842,18 @@ function Start-DomainControllerPromotion {
         Write-JujuWarning "$COMPUTER_NAME is already a domain controller"
         return
     }
-
-    $cfg = Get-JujuCharmConfig
+    $adminCreds = Get-ADAdminCredentials
     # After the reboot when the AD forest is installed, it takes a while until AD is initialized.
     # The following function will give 404 until AD is ready, thus a retry is needed.
     $adminName = Start-ExecuteWithRetry -ScriptBlock { Get-AdministratorAccount } -MaxRetryCount 30 -RetryInterval 10 `
                                         -RetryMessage "Failed to get Administrator account name. Probably AD is loading after reboot. Retrying..."
 
     Write-JujuWarning "Setting local administrator password."
-    Add-WindowsUser $adminName $cfg['administrator-password']
+    Add-WindowsUser $adminName $adminCreds['administrator-password']
 
-    $secureLocalPass = ConvertTo-SecureString $cfg['administrator-password'] -AsPlainText -Force
+    $secureLocalPass = ConvertTo-SecureString $adminCreds['administrator-password'] -AsPlainText -Force
     $localCredential = New-Object PSCredential($adminName, $secureLocalPass)
-    $domainCreds = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
+    $domainCreds = Get-DomainCredential -UserName $adminName -Password $adminCreds['administrator-password']
 
     $charmDomain = Get-CharmDomain
     Join-Domain -Domain $charmDomain -LocalCredential $localCredential -DomainCredential $domainCreds
@@ -853,7 +861,7 @@ function Start-DomainControllerPromotion {
     Write-JujuWarning "Promoting $COMPUTER_NAME to Domain Controller"
 
     $netbiosName = $charmDomain.Split('.')[0]
-    $safeModeSecurePass = ConvertTo-SecureString $cfg['safe-mode-password'] -AsPlainText -Force
+    $safeModeSecurePass = ConvertTo-SecureString $adminCreds['safe-mode-password'] -AsPlainText -Force
     $stat = Start-ExecuteWithRetry {
         $stat = Install-ADDSDomainController -InstallDns -CriticalReplicationOnly:$false `
             -DomainName $netbiosName -SafeModeAdministratorPassword $safeModeSecurePass `
@@ -871,7 +879,7 @@ function Start-DomainControllerPromotion {
     # Change all the Juju services to run under AD administrator, otherwise they
     # won't start after reboot.
     $jujuServices = (Get-Service -Name "jujud-*").Name
-    Set-ServiceLogon -Services $jujuServices -UserName $domainUser -Password $cfg['administrator-password']
+    Set-ServiceLogon -Services $jujuServices -UserName $domainUser -Password $adminCreds['administrator-password']
 
     if($stat.RebootRequired) {
         Invoke-JujuReboot -Now
@@ -937,11 +945,11 @@ function New-RelationDNSReconds {
 
 function Uninstall-ADDC {
     Write-JujuWarning "Destroying AD domain controller $COMPUTER_NAME"
+    $adminCreds = Get-ADAdminCredentials
 
-    $cfg = Get-JujuCharmConfig
     $adminName = Get-AdministratorAccount
-    $domainCredential = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
-    $uninstallSecurePass = ConvertTo-SecureString $cfg['administrator-password'] -AsPlainText -Force
+    $domainCredential = Get-DomainCredential -UserName $adminName -Password $adminCreds['administrator-password']
+    $uninstallSecurePass = ConvertTo-SecureString $adminCreds['administrator-password'] -AsPlainText -Force
 
     $parameters = @{
         'Credential' = $domainCredential
@@ -986,6 +994,8 @@ function Uninstall-ADDC {
 }
 
 function Remove-UnitFromDomain {
+    $adminCreds = Get-ADAdminCredentials
+
     # Restore default DNS nameservers
     $nameservers = Get-CharmState -Namespace "AD" -Key "nameservers"
     if ($nameservers) {
@@ -1000,10 +1010,9 @@ function Remove-UnitFromDomain {
         Remove-CharmState -Namespace "AD" -Key "nameservers" | Out-Null
     }
 
-    $cfg = Get-JujuCharmConfig
     $adminName = Get-AdministratorAccount
     $localAdmin = "{0}\{1}" -f @($COMPUTER_NAME, $adminName)
-    $adminSecurePass = ConvertTo-SecureString $cfg['administrator-password'] -AsPlainText -Force
+    $adminSecurePass = ConvertTo-SecureString $adminCreds['administrator-password'] -AsPlainText -Force
     $localCreds = New-Object PSCredential($localAdmin, $adminSecurePass)
 
     # Join the default WORKGROUP
@@ -1031,6 +1040,7 @@ function Install-ADCertificationAuthority {
         [Parameter(Mandatory=$true)]
         [System.String]$CAName
     )
+    $adminCreds = Get-ADAdminCredentials
 
     $existingCAs = Get-ADCertificationAuthority -CAName $CAName
     if($existingCAs) {
@@ -1042,7 +1052,7 @@ function Install-ADCertificationAuthority {
 
     $adminName = Get-AdministratorAccount
     $cfg = Get-JujuCharmConfig
-    $domainCredential = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
+    $domainCredential = Get-DomainCredential -UserName $adminName -Password $adminCreds['administrator-password']
 
     Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -Credential $domainCredential -CACommonName $CAName -Confirm:$false -Force | Out-Null
 
@@ -1220,10 +1230,10 @@ function Remove-ADComputerFromADForest {
         Write-JujuWarning "You need to specify a name to delete"
         return
     }
-
+    $adminCreds = Get-ADAdminCredentials
     $adminName = Get-AdministratorAccount
-    $cfg = Get-JujuCharmConfig
-    $domainCredential = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
+
+    $domainCredential = Get-DomainCredential -UserName $adminName -Password $adminCreds['administrator-password']
 
     $computerObject = Get-ADComputer -Identity $Computer
     if($computerObject) {
@@ -1234,7 +1244,7 @@ function Remove-ADComputerFromADForest {
     $ZoneName = Get-CharmDomain
     $DNSResources = $null
     $DNSResources = Get-DnsServerResourceRecord -ZoneName $ZoneName -Node $Computer -ErrorAction SilentlyContinue
-    if($DNSResources -ne $null){
+    if($null -ne $DNSResources){
         $DNSResources | ForEach-Object { Remove-DnsServerResourceRecord -ZoneName $ZoneName -InputObject $_ -Force -ErrorAction Stop }
     }
 }
@@ -1247,10 +1257,15 @@ function Start-TransferFSMORoles {
     }
 
     $currentMachineName = [System.Net.Dns]::GetHostName()
-    $cfg = Get-JujuCharmConfig
     Write-JujuWarning 'Transferring FSMO roles to leader'
     Move-ADDirectoryServerOperationMasterRole -Identity $currentMachineName -OperationMasterRole 0,1,2,3,4 -Force -Confirm:$false -ErrorAction Stop
     Write-JujuWarning 'FSMO roles transferred'
+
+    # Replace main-domain-controller with this node.
+    $settings = @{
+        'main-domain-controller' = Get-JujuUnitPrivateIP
+    }
+    Start-NotifyPeers -Settings $settings
 }
 
 function Set-ConstraintsDelegation {
@@ -1372,14 +1387,76 @@ function Clear-ComputerConstraintsDelegations {
 
 # HOOKS METHODS
 
+function Get-ADAdminCredentials {
+    $leaderData = Get-LeaderData
+    $neededCreds = @(
+        "administrator-password",
+        "safe-mode-password",
+        "domain-user-password")
+    $ret = @{}
+    foreach ($item in $neededCreds) {
+        $ret[$item] = $leaderData[$item]
+    }
+    if ($null -in $ret.Values) {
+        return $null
+    }
+    return $ret
+}
+
+function Set-ADAdminCredentials {
+    $isLeader = Confirm-Leader
+    if ($isLeader -eq $false) {
+        return
+    }
+
+    $cfg = Get-JujuCharmConfig
+    $leaderData = Get-LeaderData
+
+    $neededCreds = @{
+        "administrator-password" = $null;
+        "safe-mode-password" = $null;
+        "domain-user-password" = $null;
+    }
+    $credsToSet = @{}
+    foreach ($item in $neededCreds.Keys) {
+        if (!$leaderData[$item]){
+            $passwd = $cfg[$item]
+            if (!$passwd) {
+                $passwd = Get-RandomString -Length 16 -Weak:$true
+            }
+            $credsToSet[$item] = $passwd
+        }
+    }
+    Set-LeaderData -Settings $credsToSet
+}
+
+function Wait-ForADCreds {
+    $isLeader = Confirm-Leader
+    if (!$isLeader) {
+        $adCreds = Get-ADAdminCredentials
+        while ($null -eq $adCreds) {
+            Set-JujuStatus -Status waiting -Message "Waiting for admin credentials from leader"
+            Start-Sleep 5
+        }
+        Set-JujuStatus -Status maintenance
+    }
+}
+
 function Invoke-InstallHook {
     Write-JujuWarning "Running install hook"
+
+    # The leader will ensure that the local administrator passwors, the domain admin password
+    # and the safe mode password are stored in leader data. These settings will become immutable.
+    # The secondary AD nodes will wait for the leader to set the credentials
+    Set-ADAdminCredentials
+    Wait-ForADCreds
 
     $isLeader = Confirm-Leader
     $mainDCIP = Get-LeaderData -Attribute 'main-domain-controller'
     if(!$mainDCIP -and $isLeader) {
+        $mainDCIP = Get-JujuUnitPrivateIP
         Set-LeaderData -Settings @{
-            'main-domain-controller' = Get-JujuUnitPrivateIP
+            'main-domain-controller' = $mainDCIP
         }
     }
 
@@ -1413,7 +1490,6 @@ function Invoke-InstallHook {
         'DNS', 'RSAT-DNS-Server', 'GPMC'
     )
 
-    $mainDCIP = Get-LeaderData -Attribute 'main-domain-controller'
     $privateIP = Get-JujuUnitPrivateIP
     if($mainDCIP -ne $privateIP) {
         Write-JujuWarning "Current unit is not the main domain controller unit"
@@ -1424,7 +1500,24 @@ function Invoke-InstallHook {
     Restore-DefaultResolvers
     Open-ADDCPorts
 
+    $relationSettings = @{
+        "forest-installed" = $true
+    }
+    Start-NotifyPeers -Settings $relationSettings
     Set-JujuStatus -Status "active" -Message "Unit is ready"
+}
+
+
+function Start-NotifyPeers {
+    Param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$Settings
+    )
+
+    $rids = Get-JujuRelationIds -Relation 'ad-peer'
+    foreach($rid in $rids) {
+        Set-JujuRelation -RelationId $rid -Settings $settings
+    }
 }
 
 function Invoke-LeaderElectedHook {
@@ -1478,8 +1571,8 @@ function Invoke-StopHook {
         #                  Sometimes, function 'Get-AdministratorAccount' may return an array with both the names for local administrator and domain administrator.
         [array]$adminNames = Get-AdministratorAccount
         $adminName = $adminNames[0]
-        $cfg = Get-JujuCharmConfig
-        $domainCredential = Get-DomainCredential -UserName $adminName -Password $cfg['administrator-password']
+        $adminCreds = Get-ADAdminCredentials
+        $domainCredential = Get-DomainCredential -UserName $adminName -Password $adminCreds['administrator-password']
 
         Write-JujuWarning "Removing $COMPUTER_NAME from AD domain"
         Remove-ADObject -Identity $computerObject -Recursive -Confirm:$false -Credential $domainCredential | Out-Null
@@ -1536,6 +1629,7 @@ function Invoke-ADJoinRelationDepartedHook {
     if(!$blob) {
         return
     }
+
     # Check if there is another collocated charm joined to the AD domain. If
     # so, we don't need to remove the machine from AD.
     $currentRelationId = Get-JujuRelationId
@@ -1670,6 +1764,10 @@ function Invoke-UpdateStatusHook {
         return
     }
     $domainCreds = Get-DomainAdminCredentials
+    if (!$domainCreds) {
+        Write-JujuWarning "Invoke-UpdateStatusHook: Domain credentials not yet available"
+        return $false
+    }
     $rids = Get-JujuRelationIds -Relation 'ad-peer'
 
     $computerNames = @(
